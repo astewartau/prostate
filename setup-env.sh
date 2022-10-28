@@ -20,3 +20,4 @@ python setup.py install --user
 
 # upate library path (add this to .bashrc)
 export LD_LIBRARY_PATH="/scratch/itee/uqaste15/miniconda3/lib/:${LD_LIBRARY_PATH}"
+pip install nibabel
