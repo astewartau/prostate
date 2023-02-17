@@ -2,9 +2,19 @@ import torch
 import numpy as np
 from matplotlib import pyplot as plt
 
-def show_histogram(data, mask=None, title=None, n_bins=100, n_ticks=10, vrange_hist=None, vrange_ylim=None, vrange_imshow=None, cmap='gray', **args):
+def get_slice(volume, dim=0, slice_idx=None):
+    if slice_idx is None:
+        slice_idx = volume.shape[dim] // 2
+    idx_tuple = tuple(slice_idx if i == dim else slice(None) for i in range(len(volume.shape)))
+    return volume[idx_tuple]
+
+def show_histogram(data, mask=None, title=None, dim=0, n_bins=100, n_ticks=10, vrange_hist=None, vrange_ylim=None, vrange_imshow=None, cmap='gray', **args):
     # fix data
     if not isinstance(data, torch.Tensor): data = torch.tensor(data)
+
+    # get slice
+    slice = get_slice(data, dim=dim) if data.dim() == 3 else data
+    if mask is not None: mask_slice = get_slice(mask) if mask.dim() == 3 else mask
     
     # superfigure
     fig, (ax1, ax2) = plt.subplots(1,2)
@@ -14,8 +24,8 @@ def show_histogram(data, mask=None, title=None, n_bins=100, n_ticks=10, vrange_h
     # data subplot
     if vrange_imshow is None: vrange_imshow = (float(data.min()), float(data.max()))
     ax1.set_title = "Data"
-    im = ax1.imshow(data, vmin=vrange_imshow[0], vmax=vrange_imshow[1], cmap=cmap, **args)
-    if mask is not None: ax1.imshow(mask, cmap='jet', interpolation='none', alpha=1.0*(mask>0))
+    im = ax1.imshow(slice, vmin=vrange_imshow[0], vmax=vrange_imshow[1], cmap=cmap, **args)
+    if mask is not None: ax1.imshow(mask_slice, cmap='jet', interpolation='none', alpha=1.0*(mask_slice>0))
     ax1.set_axis_off()
     plt.colorbar(im, ax=ax1)#, orientation='horizontal')#, pad=0.2)
 
