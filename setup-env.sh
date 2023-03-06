@@ -19,4 +19,4 @@ conda install ipykernel ipywidgets
 pip install nibabel fastmonai
 
 # upate library path (add this to .bashrc)
-export LD_LIBRARY_PATH="/scratch/itee/uqaste15/miniconda3/lib/:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="~/miniconda3/lib/:${LD_LIBRARY_PATH}"
