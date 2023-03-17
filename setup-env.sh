@@ -1,3 +1,7 @@
+# remove previous environment
+conda activate base
+conda env remove --name prostate
+
 # get miniconda
 wget https://repo.anaconda.com/miniconda/Miniconda3-py38_4.12.0-Linux-x86_64.sh -O miniconda.sh
 chmod +x miniconda.sh
@@ -12,7 +16,7 @@ conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch
 conda install -c fastchan fastai
 conda install ipykernel ipywidgets
 #conda install -c conda-forge gxx_linux-64=11.1.0
+pip install nibabel fastmonai
 
 # upate library path (add this to .bashrc)
-export LD_LIBRARY_PATH="/scratch/itee/uqaste15/miniconda3/lib/:${LD_LIBRARY_PATH}"
-pip install nibabel
+export LD_LIBRARY_PATH="~/miniconda3/lib/:${LD_LIBRARY_PATH}"

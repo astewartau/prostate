@@ -1,4 +1,7 @@
+__pycache__/
 *tar
 data
 models
 .ipynb_checkpoints
+bids/
+*.png
