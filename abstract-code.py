@@ -23,8 +23,8 @@ class SegType(Enum):
 def clean_masks():
     # identify relevant QSM and segmentation files
     script_path = os.path.dirname(os.path.abspath(__file__))
-    qsm_files = glob.glob(f"{script_path}/bids/sub-*/ses-*/extra_data/*qsm.*")
-    seg_files = glob.glob(f"{script_path}/bids/sub-*/ses-*/extra_data/*segmentation.*")
+    qsm_files = [x for x in sorted(glob.glob(f"{script_path}/bids/sub-*/ses-*/extra_data/*qsm.*")) if '-new' not in x]
+    seg_files = [x for x in sorted(glob.glob(f"{script_path}/bids/sub-*/ses-*/extra_data/*segmentation.*")) if '-new' not in x]
     assert(len(qsm_files) == len(seg_files))
     print(f"Found {len(qsm_files)} QSM and segmentation files!")
     
@@ -44,9 +44,12 @@ def clean_masks():
         # identify susceptibility values less than two standard deviations below the mean
         inliers = qsm + 3*np.std(prostate_values) > np.mean(qsm)
 
-        # clean up segmentations such that 'inliers' are excluded
+        # clean up segmentations such that 'inliers' are excluded and prostate is removed
         seg[np.logical_and(seg == SegType.GOLD_SEED.value, inliers)] = 0
         seg[np.logical_and(seg == SegType.CALCIFICATION.value, inliers)] = 0
+        seg[seg == SegType.PROSTATE.value] = 0
+        seg[seg == SegType.GOLD_SEED.value] = 1
+        seg[seg == SegType.CALCIFICATION.value] = 2
 
         # save result using original file extension
         extension = ".".join(seg_files[i].split('.')[1:])
