@@ -3,5 +3,6 @@ __pycache__/
 data
 models
 .ipynb_checkpoints
-bids/
+bids*/
+qsm*/
 *.png
