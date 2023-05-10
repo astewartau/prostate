@@ -6,3 +6,7 @@ models
 bids*/
 qsm*/
 *.png
+*Bids*/
+*bids*/
+*qsm*/
+*.nii
