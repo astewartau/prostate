@@ -16,7 +16,7 @@ conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch
 conda install -c fastchan fastai
 conda install ipykernel ipywidgets
 #conda install -c conda-forge gxx_linux-64=11.1.0
-pip install nibabel fastmonai
+pip install nibabel fastmonai nbconvert
 
 # upate library path (add this to .bashrc)
 export LD_LIBRARY_PATH="~/miniconda3/lib/:${LD_LIBRARY_PATH}"

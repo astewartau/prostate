@@ -10,3 +10,7 @@ qsm*/
 *bids*/
 *qsm*/
 *.nii
+*.dcm*
+*.IMA*
+dicom/
+*.html
