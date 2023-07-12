@@ -11,8 +11,11 @@ s = ArgParseSettings()
     "--TEs"
         help = "input - echo times (s)"
         required = true
-    "--output"
+    "--t2starmap"
         help = "output - t2* map"
+        required = true
+    "--r2starmap"
+        help = "output - r2* map"
         required = true
 end
 
@@ -23,6 +26,8 @@ TEs = let expr = Meta.parse(args["TEs"])
     @assert expr.head == :vect
     Float32.(expr.args)
 end
+
+TEs *= 1e3
 
 # get magnitude filenames
 mag_files = args["magnitude"]
@@ -43,5 +48,7 @@ end
 
 # create and save t2starmap
 t2starmap = NumART2star(mag_combined, TEs)
-savenii(t2starmap, args["output"]; header=header(mag_nii))
+savenii(t2starmap, args["t2starmap"]; header=header(mag_nii))
+r2starmap = r2s_from_t2s(t2starmap)
+savenii(r2starmap, args["r2starmap"]; header=header(mag_nii))
 

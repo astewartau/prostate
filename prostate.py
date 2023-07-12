@@ -2,6 +2,7 @@ import fastMONAI.vision_all
 import torch
 import fastai
 import numpy as np
+import scipy.ndimage
 from skimage.measure import label, regionprops
 from matplotlib import pyplot as plt
 
@@ -82,8 +83,6 @@ def show_results(x:fastMONAI.vision_all.MedImage, y:fastMONAI.vision_all.MedMask
     show_images(x, outs, fig_out=f"{fig_out.split('.')[0]}_pred.png")
     
 
-import scipy.ndimage
-
 class MarkersIdentified(fastai.metrics.Metric):
     def __init__(self):
         super().__init__()
@@ -107,16 +106,30 @@ class MarkersIdentified(fastai.metrics.Metric):
         pred = scipy.ndimage.binary_dilation(pred)
         targ = scipy.ndimage.binary_dilation(targ)
 
-        for i in range(targ.shape[0]):
-            _, pred_nlabels = scipy.ndimage.label(pred[i])
-            _, targ_nlabels = scipy.ndimage.label(targ[i])
-            
-            overlap = np.array(np.logical_and(pred[i] == targ[i], pred[i] == 1), dtype=int)
-            _, n_overlaps = scipy.ndimage.label(overlap)
-            
-            self.pred_marker_count += pred_nlabels
-            self.targ_marker_count += targ_nlabels
-            self.overlap_count += n_overlaps
+        structure = np.ones((3, 3, 3)) == True
+
+        for i in range(pred.shape[0]):
+            if len(pred[i].shape) == 3:
+                _, pred_nlabels = scipy.ndimage.label(pred[i], structure=structure)
+                _, targ_nlabels = scipy.ndimage.label(targ[i][0], structure=structure)
+
+                overlap = np.array(np.logical_and(pred[i] == targ[i][0], pred[i] == 1), dtype=int)
+                _, n_overlaps = scipy.ndimage.label(overlap, structure=structure)
+                
+                self.pred_marker_count += pred_nlabels
+                self.targ_marker_count += targ_nlabels
+                self.overlap_count += n_overlaps
+            else:
+                for j in range(pred[i].shape[0]):
+                    _, pred_nlabels = scipy.ndimage.label(pred[i][j], structure=structure)
+                    _, targ_nlabels = scipy.ndimage.label(targ[i][j], structure=structure)
+                
+                    overlap = np.array(np.logical_and(pred[i][j] == targ[i][j], pred[i][j] == 1), dtype=int)
+                    _, n_overlaps = scipy.ndimage.label(overlap, structure=structure)
+                    
+                    self.pred_marker_count += pred_nlabels
+                    self.targ_marker_count += targ_nlabels
+                    self.overlap_count += n_overlaps
 
     @property
     def value(self):
@@ -145,15 +158,30 @@ class SuperfluousMarkers(fastai.metrics.Metric):
         pred = scipy.ndimage.binary_dilation(pred)
         targ = scipy.ndimage.binary_dilation(targ)
 
-        for i in range(targ.shape[0]):
-            _, pred_nlabels = scipy.ndimage.label(pred[i] == 1)
-            _, targ_nlabels = scipy.ndimage.label(targ[i] == 1)
-            overlap = np.array(np.logical_and(pred[i] == targ[i], pred[i] == 1), dtype=int)
-            _, n_overlaps = scipy.ndimage.label(overlap)
-            
-            self.pred_marker_count += pred_nlabels
-            self.targ_marker_count += targ_nlabels
-            self.overlap_count += n_overlaps
+        structure = np.ones((3, 3, 3)) == True
+
+        for i in range(pred.shape[0]):
+            if len(pred[i].shape) == 3:
+                _, pred_nlabels = scipy.ndimage.label(pred[i], structure=structure)
+                _, targ_nlabels = scipy.ndimage.label(targ[i][0], structure=structure)
+
+                overlap = np.array(np.logical_and(pred[i] == targ[i][0], pred[i] == 1), dtype=int)
+                _, n_overlaps = scipy.ndimage.label(overlap, structure=structure)
+                
+                self.pred_marker_count += pred_nlabels
+                self.targ_marker_count += targ_nlabels
+                self.overlap_count += n_overlaps
+            else:
+                for j in range(pred[i].shape[0]):
+                    _, pred_nlabels = scipy.ndimage.label(pred[i][j], structure=structure)
+                    _, targ_nlabels = scipy.ndimage.label(targ[i][j], structure=structure)
+                
+                    overlap = np.array(np.logical_and(pred[i][j] == targ[i][j], pred[i][j] == 1), dtype=int)
+                    _, n_overlaps = scipy.ndimage.label(overlap, structure=structure)
+                    
+                    self.pred_marker_count += pred_nlabels
+                    self.targ_marker_count += targ_nlabels
+                    self.overlap_count += n_overlaps
 
     @property
     def value(self):

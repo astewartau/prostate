@@ -18,11 +18,21 @@ import datetime
 import sys
 
 import pandas as pd
+import numpy as np
+import nibabel as nib
+
+import random
+import fastai
+import fastcore.transform
 import fastMONAI.vision_all
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
+from monai.transforms import MapTransform
 from sklearn.model_selection import KFold
+
+import scipy.ndimage 
 from sklearn.model_selection import train_test_split
+from skimage.measure import label, regionprops
 
 from useful_functions import *
 from prostate import *
@@ -43,71 +53,94 @@ print(f"{len(session_dirs)} sessions found")
 session_dirs
 
 # %%
-qsm_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*qsm_echo2-and-echo4.*")) for session_dir in session_dirs), []))
-seg_clean_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "sub*ses*segmentation_clean.*")) for session_dir in session_dirs), []))
-t1_resampled_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*t1_tra*_resampled.nii*")) for session_dir in session_dirs), []))
-t2s_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*t2starmap.nii*")) for session_dir in session_dirs), []))
-swi_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*swi.nii*")) for session_dir in session_dirs), []))
-mag_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "magnitude_combined.nii")) for session_dir in session_dirs), []))
-t1_files = [t1_file.replace("_resampled", "") for t1_file in t1_resampled_files]
-seg_files = [seg_clean_file.replace("_clean", "") for seg_clean_file in seg_clean_files]
-
 extra_files = sum((glob.glob(os.path.join(session_dir, "extra_data", "*.nii*")) for session_dir in session_dirs), [])
-ct_files = [extra_file for extra_file in extra_files if any(pattern in extra_file for pattern in ['_na_', '_Pelvis_']) and not any(pattern in extra_file for pattern in ['_t1_tra_', 'ATX', 'AXT', 'ROI', 'resliced', 'segmentation'])]
 
-ct_seg_files = sum((glob.glob(ct_file.replace(".nii", "_segmentation_clean.nii")) for ct_file in ct_files), [])
-ct_resliced_files = sum((glob.glob(ct_file.replace(".nii", "_resliced.nii")) for ct_file in ct_files), [])
-ct_resliced_seg_files = sum((glob.glob(ct_file.replace(".nii", "_segmentation_clean.nii")) for ct_file in ct_resliced_files), [])
+qsm_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*qsm_echo2-and-echo4.*")) for session_dir in session_dirs), []))
+t2s_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*t2starmap.nii*")) for session_dir in session_dirs), []))
+r2s_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*r2starmap.nii*")) for session_dir in session_dirs), []))
+mag_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "magnitude_combined.nii")) for session_dir in session_dirs), []))
+swi_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "swi.nii")) for session_dir in session_dirs), []))
 
-ct_files = [ct_file for ct_file in ct_files if 'z0237546' not in ct_file]
-ct_seg_files = [ct_file for ct_file in ct_seg_files if 'z0237546' not in ct_file]
-ct_resliced_files = [ct_file for ct_file in ct_resliced_files if 'z0237546' not in ct_file]
-ct_resliced_seg_files = [ct_file for ct_file in ct_resliced_seg_files if 'z0237546' not in ct_file]
+gre_seg_raw_files = [extra_file for extra_file in extra_files if all(pattern in extra_file for pattern in ['_segmentation.', 'run'])]
+gre_seg_clean_files = [seg_file.replace(".nii", "_clean.nii") for seg_file in gre_seg_raw_files if os.path.exists(seg_file.replace(".nii", "_clean.nii"))]
+
+t1_files = [extra_file for extra_file in extra_files if any(pattern in extra_file for pattern in ['_T1w', '_t1_tra']) and not any(pattern in extra_file for pattern in ['_Pelvis_', '.json', '_resampled'])]
+t1_files = [t1_file.replace("_resampled", "") for t1_file in t1_files]
+t1_resampled_files = [t1_file.replace(".nii", "_resampled.nii") for t1_file in t1_files if os.path.exists(t1_file.replace(".nii", "_resampled.nii"))]
+
+ct_files = [extra_file for extra_file in extra_files if 'resliced' in extra_file and any(pattern in extra_file for pattern in ['_na_', '_Pelvis_', '_NA']) and not any(pattern in extra_file for pattern in ['_t1_tra_', 'ATX', 'AXT', 'ROI', 'segmentation', '.json'])]
+ct_seg_raw_files = sum((glob.glob(ct_file.replace(".nii", "_segmentation.nii")) for ct_file in ct_files), [])
+ct_seg_clean_files = [ct_file.replace("_segmentation", "_segmentation_clean") for ct_file in ct_seg_raw_files if os.path.exists(ct_file)]
 
 print(f"{len(ct_files)} CT images found.")
-print(f"{len(ct_seg_files)} CT segmentations found.")
-print(f"{len(ct_resliced_files)} resliced CT images found.")
-print(f"{len(ct_resliced_seg_files)} resliced CT segmentations found.")
+print(f"{len(ct_seg_raw_files)} raw CT segmentations found.")
+print(f"{len(ct_seg_clean_files)} clean CT segmentations found.")
 print(f"{len(qsm_files)} QSM images found.")
 print(f"{len(mag_files)} magnitude images found.")
 print(f"{len(t2s_files)} T2* maps found.")
-print(f"{len(swi_files)} SWI images found.")
+print(f"{len(r2s_files)} R2* maps found.")
+print(f"{len(swi_files)} SWI maps found.")
 print(f"{len(t1_files)} T1w files found.")
 print(f"{len(t1_resampled_files)} resampled T1w files found.")
-print(f"{len(seg_files)} GRE segmentations found.")
-print(f"{len(seg_clean_files)} cleaned GRE segmentations found.")
+print(f"{len(gre_seg_raw_files)} raw GRE segmentations found.")
+print(f"{len(gre_seg_clean_files)} clean GRE segmentations found.")
 
 # %%
-assert(len(qsm_files) == len(seg_clean_files))
+assert(len(qsm_files) == len(gre_seg_clean_files))
 assert(len(qsm_files) == len(t2s_files))
+assert(len(qsm_files) == len(r2s_files))
 assert(len(qsm_files) == len(swi_files))
 assert(len(qsm_files) == len(mag_files))
 assert(len(qsm_files) == len(t1_resampled_files))
-assert(len(ct_files) == len(ct_seg_files))
-assert(len(ct_resliced_files) == len(ct_resliced_seg_files))
+assert(len(ct_files) == len(ct_seg_clean_files))
 
 # %% [markdown]
 # # Parameters
 
 # %%
 model_data = {
-    'CT' : { 'in_files' : [f"{ct_resliced_files[i]}" for i in range(len(ct_resliced_files))], 'seg_files': ct_resliced_seg_files },
-    'QSM' : { 'in_files' : [f"{qsm_files[i]}" for i in range(len(qsm_files))], 'seg_files': seg_clean_files },
-    'QSM-T1' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': seg_clean_files },
-    'T1' : { 'in_files' : [f"{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': seg_clean_files },
-    'SWI' : { 'in_files' : [f"{swi_files[i]}" for i in range(len(qsm_files))], 'seg_files': seg_clean_files },
-    'GRE' : { 'in_files' : [f"{mag_files[i]}" for i in range(len(qsm_files))], 'seg_files': seg_clean_files },
+    'CT' : { 'in_files' : [f"{ct_files[i]}" for i in range(len(ct_files))], 'seg_files': ct_seg_clean_files },
+    'QSM-T1-T2s' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]};{t2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'QSM-T1-R2s' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]};{r2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'QSM-T1' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'QSM' : { 'in_files' : [f"{qsm_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'SWI' : { 'in_files' : [f"{swi_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'T1' : { 'in_files' : [f"{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'T2s' : { 'in_files' : [f"{t2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'R2s' : { 'in_files' : [f"{r2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'GRE' : { 'in_files' : [f"{mag_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
 }
+
+# %%
+class AugmentMarkers(fastcore.transform.ItemTransform):
+
+    inverted_ids = []
+
+    def encodes(self, xy):
+        # convert data
+        x, y = xy
+        x = x.numpy()
+        y_np = np.array(y.numpy() == 1, dtype=int)[0,:,:,:]
+
+        # determine connected regions
+        labels, nlabels = scipy.ndimage.label(y_np, structure=scipy.ndimage.generate_binary_structure(3, 3))
+
+        # invert some markers with 5% probability
+        for i in range(nlabels):
+            if random.random() <= 0.05:
+                self.inverted_ids.append(i+1)
+                x[0,labels == i+1] *= -1
+
+        return (fastMONAI.vision_all.MedImage(x), y)
 
 # %%
 model_name = sys.argv[1]
 fold_id = int(sys.argv[2])
-k_folds = 6
-test_size = 3
+k_folds = 24
 random_state = 42
 timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d-%H%M%S')
 
-batch_size = 4
+batch_size = 6
 training_epochs = 700
 lr = 0.003
 ce_loss_weights = torch.Tensor([1, 1, 1])
@@ -116,30 +149,26 @@ training_augmentations = [
     fastMONAI.vision_all.RandomFlip(axes=("LR",)),
     fastMONAI.vision_all.RandomFlip(axes=("AP",)),
     fastMONAI.vision_all.RandomAffine(degrees=(90, 90, 90)),
-    fastMONAI.vision_all.ZNormalization(),
+    fastMONAI.vision_all.ZNormalization()
 ]
+
+if 'QSM' in model_name: training_augmentations.append(AugmentMarkers())
 
 # %%
 # split training/testing
 df = pd.DataFrame(model_data[model_name])
-train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state)
-print(f"Training samples shape: {train_df.shape}")
-print(f"Testing samples shape: {test_df.shape}")
-
-# train over k validation folds
-kf = KFold(n_splits=k_folds, random_state=random_state, shuffle=True)
-(train_index, valid_index) = list(kf.split(train_df))[fold_id]
 
 # determine resampling suggestion
 med_dataset = fastMONAI.vision_all.MedDataset(
-    img_list=train_df.seg_files.tolist(),
+    img_list=df.seg_files.tolist(),
     dtype=fastMONAI.vision_all.MedMask
 )
 suggested_voxelsize, requires_resampling = med_dataset.suggestion()
 largest_imagesize = med_dataset.get_largest_img_size(resample=suggested_voxelsize)
-print(f"Suggested voxel size: {suggested_voxelsize}")
-print(f"Requires resampling: {requires_resampling}")
-print(f"Largest image size: {largest_imagesize}")
+
+# train over k validation folds
+kf = KFold(n_splits=k_folds, random_state=random_state, shuffle=True)
+(train_index, valid_index) = list(kf.split(df))[fold_id]
 
 # prepare dataloader
 dls = fastMONAI.vision_all.DataLoaders.from_dblock(
@@ -152,7 +181,7 @@ dls = fastMONAI.vision_all.DataLoaders.from_dblock(
         reorder=requires_resampling,
         resample=suggested_voxelsize
     ),
-    train_df,
+    df,
     bs=batch_size
 )
 
@@ -176,10 +205,7 @@ learn = fastMONAI.vision_all.Learner(
     opt_func=fastMONAI.vision_all.ranger,
     metrics=[fastMONAI.vision_all.multi_dice_score, MarkersIdentified(), SuperfluousMarkers()]#.to_fp16()
 )
-print(f"Training examples: {len(dls.train_ds.items)}")
-print(f"Validation examples: {len(dls.valid_ds.items)}")
 
-print("Training...")
 start_time = time.time()
 learn.fit_flat_cos(
     training_epochs,

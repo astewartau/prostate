@@ -34,9 +34,15 @@ TEs = let expr = Meta.parse(args["TEs"])
     Float32.(expr.args)
 end
 
+TEs *= 1e3
+
 # get magnitude filenames
 mag_files = args["magnitude"]
 phs_files = args["phase"]
+
+print(mag_files)
+print(phs_files)
+print(TEs)
 
 # determine dimensions and array size
 mag_nii = readmag(mag_files[1])
