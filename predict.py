@@ -20,6 +20,49 @@ from useful_functions import *
 from prostate import *
 
 # %%
+def pad_or_crop_tensor(input_tensor, target_size, interpolation='trilinear'):
+    # Calculate padding or cropping values for depth, height and width
+    diff_depth = target_size[0] - input_tensor.shape[0]
+    diff_height = target_size[1] - input_tensor.shape[1]
+    diff_width = target_size[2] - input_tensor.shape[2]
+
+    # Handle depth
+    if diff_depth > 0:
+        pad_depth = diff_depth
+        crop_depth = slice(None)
+    else:
+        pad_depth = 0
+        crop_depth = slice(-diff_depth // 2, diff_depth // 2 + input_tensor.shape[0])
+
+    # Handle height
+    if diff_height > 0:
+        pad_height = diff_height
+        crop_height = slice(None)
+    else:
+        pad_height = 0
+        crop_height = slice(-diff_height // 2, diff_height // 2 + input_tensor.shape[1])
+
+    # Handle width
+    if diff_width > 0:
+        pad_width = diff_width
+        crop_width = slice(None)
+    else:
+        pad_width = 0
+        crop_width = slice(-diff_width // 2, diff_width // 2 + input_tensor.shape[2])
+
+    # Apply padding if needed
+    if pad_depth > 0 or pad_height > 0 or pad_width > 0:
+        input_tensor = torch.nn.functional.pad(
+            input_tensor, 
+            (pad_width//2, pad_width//2, pad_height//2, pad_height//2, pad_depth//2, pad_depth//2)
+        )
+
+    # Crop tensor if needed
+    input_tensor = input_tensor[crop_depth, crop_height, crop_width]
+
+    return input_tensor
+
+# %%
 bids_dir = "bids-new"
 
 # %%
@@ -87,8 +130,15 @@ model_data = { # CT, QSM, QSM-T1-R2s, QSM-T1, GRE, T1, SWI, R2s, T2s
 }
 
 # %%
+
+# sub-z023 : bleed example
+# sub-z003 : regular example
+# sub-z177 : isointense example
+# sub-z0755228 : lots of calcification
+# sub-z1728751 : lots of calcification
+# sub-z3278008 : lots of calcification
+
 model_name = 'QSM'
-subject_name = 'sub-z023'
 k_folds = 24
 random_state = 42
 batch_size = 6
@@ -97,15 +147,10 @@ evaluation_augmentations = [
     fastMONAI.vision_all.PadOrCrop([80, 80, 80]),
     fastMONAI.vision_all.ZNormalization(),
 ]
+subjects = [x.split(os.sep)[1] for x in session_dirs]
 
 # split training/testing
 df = pd.DataFrame(model_data[model_name])
-
-# %%
-if not df.applymap(lambda cell: subject_name in str(cell)).any().any():
-    print(f"ERROR: Subject {subject_name} not found!")
-
-# %%
 
 # determine resampling suggestion
 med_dataset = fastMONAI.vision_all.MedDataset(
@@ -116,153 +161,124 @@ suggested_voxelsize, requires_resampling = med_dataset.suggestion()
 largest_imagesize = med_dataset.get_largest_img_size(resample=suggested_voxelsize)
 
 # %%
-# k validation folds
+for session_dir in session_dirs:
 
-marker_precisions = []
-marker_recalls = []
-precisions = []
-recalls = []
-fprs = []
-tprs = []
-fm_losses = []
-calc_losses = []
+    subject_name = session_dir.split(os.sep)[1]
 
-kf = list(KFold(n_splits=k_folds, random_state=random_state, shuffle=True).split(df))
+    if not df.applymap(lambda cell: subject_name in str(cell)).any().any():
+        print(f"ERROR: Subject {subject_name} not found!")
 
-# %%
-train_index = None
-valid_index = None
-for i in range(len(kf)):
-    (train_index_i, valid_index_i) = kf[i]
-    if df.iloc[valid_index_i].applymap(lambda cell: subject_name in str(cell)).any().any():
-        (train_index, valid_index) = kf[i]
-        break
-if valid_index is None:
-    print(f"ERROR: Subject {subject_name} not found")
-else:
-    print(f"Subject {subject_name} found in fold {i}")
+    marker_precisions = []
+    marker_recalls = []
+    precisions = []
+    recalls = []
+    fprs = []
+    tprs = []
+    fm_losses = []
+    calc_losses = []
 
-# %%
-dblock = fastMONAI.vision_all.MedDataBlock(
-    blocks=(fastMONAI.vision_all.ImageBlock(cls=fastMONAI.vision_all.MedImage), fastMONAI.vision_all.MedMaskBlock),
-    splitter=fastMONAI.vision_all.IndexSplitter(valid_index),
-    get_x=fastMONAI.vision_all.ColReader('in_files'),
-    get_y=fastMONAI.vision_all.ColReader('seg_files'),
-    item_tfms=evaluation_augmentations,
-    reorder=requires_resampling,
-    resample=suggested_voxelsize
-)
+    kf = list(KFold(n_splits=k_folds, random_state=random_state, shuffle=True).split(df))
 
-dls = fastMONAI.vision_all.DataLoaders.from_dblock(dblock, df, bs=batch_size)
+    train_index = None
+    valid_index = None
+    for i in range(len(kf)):
+        (train_index_i, valid_index_i) = kf[i]
+        if df.iloc[valid_index_i].applymap(lambda cell: subject_name in str(cell)).any().any():
+            (train_index, valid_index) = kf[i]
+            break
+    if valid_index is None:
+        print(f"ERROR: Subject {subject_name} not found")
+        continue
+    else:
+        print(f"Subject {subject_name} found in fold {i}")
 
-n_input_channels = len(model_data[model_name]['in_files'][0].split(';'))
-learn = fastMONAI.vision_all.Learner(
-    dls,
-    model=UNet(
-        spatial_dims=3,
-        in_channels=n_input_channels,
-        out_channels=3,
-        channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-        num_res_units=2
-    ),
-    loss_func=DiceCELoss(
-        to_onehot_y=True,
-        include_background=True,
-        softmax=True,
-        ce_weight=ce_loss_weights
-    ),
-    opt_func=fastMONAI.vision_all.ranger,
-    metrics=[fastMONAI.vision_all.multi_dice_score, MarkersIdentified(), SuperfluousMarkers()]#.to_fp16()
-)
+    dblock = fastMONAI.vision_all.MedDataBlock(
+        blocks=(fastMONAI.vision_all.ImageBlock(cls=fastMONAI.vision_all.MedImage), fastMONAI.vision_all.MedMaskBlock),
+        splitter=fastMONAI.vision_all.IndexSplitter(valid_index),
+        get_x=fastMONAI.vision_all.ColReader('in_files'),
+        get_y=fastMONAI.vision_all.ColReader('seg_files'),
+        item_tfms=evaluation_augmentations,
+        reorder=requires_resampling,
+        resample=suggested_voxelsize
+    )
 
-model_file = glob.glob(f"models/{model_name}-2*-*-{i}-best*")[0].replace('models/', '').replace('.pth', '')
-learn = learn.load(model_file)
-learn.model.cuda()
+    dls = fastMONAI.vision_all.DataLoaders.from_dblock(dblock, df, bs=batch_size)
 
-# Compute metrics on the entire training dataset
-correct_markers = MarkersIdentified()
+    n_input_channels = len(model_data[model_name]['in_files'][0].split(';'))
+    learn = fastMONAI.vision_all.Learner(
+        dls,
+        model=UNet(
+            spatial_dims=3,
+            in_channels=n_input_channels,
+            out_channels=3,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2
+        ),
+        loss_func=DiceCELoss(
+            to_onehot_y=True,
+            include_background=True,
+            softmax=True,
+            ce_weight=ce_loss_weights
+        ),
+        opt_func=fastMONAI.vision_all.ranger,
+        metrics=[fastMONAI.vision_all.multi_dice_score, MarkersIdentified(), SuperfluousMarkers()]#.to_fp16()
+    )
 
-dblock_valid_eval = fastMONAI.vision_all.MedDataBlock(
-    blocks=(fastMONAI.vision_all.ImageBlock(cls=fastMONAI.vision_all.MedImage), fastMONAI.vision_all.MedMaskBlock),
-    splitter=fastMONAI.vision_all.IndexSplitter([]),
-    get_x=fastMONAI.vision_all.ColReader('in_files'),
-    get_y=fastMONAI.vision_all.ColReader('seg_files'),
-    item_tfms=evaluation_augmentations,
-    reorder=requires_resampling,
-    resample=suggested_voxelsize
-)
-dls_valid_eval = fastMONAI.vision_all.DataLoaders.from_dblock(dblock_valid_eval, df.iloc[valid_index], bs=1, sampler=fastMONAI.vision_all.SequentialSampler)
-for x, y in dls_valid_eval.train:
-    pred = torch.argmax(learn.model(x), dim=1).unsqueeze(1).to(dtype=torch.float)
-    correct_markers.accumulate(pred=pred.cpu(), targ=y.cpu())
+    model_file = glob.glob(f"models/{model_name}-2*-*-{i}-best*")[0].replace('models/', '').replace('.pth', '')
+    learn = learn.load(model_file)
+    #learn.model.cuda()
 
-marker_tps = correct_markers.overlap_count
-marker_fps = correct_markers.pred_marker_count - correct_markers.overlap_count
-marker_fns = correct_markers.targ_marker_count - correct_markers.overlap_count
+    # Compute metrics on the entire training dataset
+    correct_markers = MarkersIdentified()
 
-marker_precision = (marker_tps / (marker_tps + marker_fps)) if (marker_tps + marker_fps) > 0 else 0
-marker_recall = (marker_tps / (marker_tps + marker_fns))  if (marker_tps + marker_fns) > 0 else 0
+    dblock_valid_eval = fastMONAI.vision_all.MedDataBlock(
+        blocks=(fastMONAI.vision_all.ImageBlock(cls=fastMONAI.vision_all.MedImage), fastMONAI.vision_all.MedMaskBlock),
+        splitter=fastMONAI.vision_all.IndexSplitter([]),
+        get_x=fastMONAI.vision_all.ColReader('in_files'),
+        get_y=fastMONAI.vision_all.ColReader('seg_files'),
+        item_tfms=evaluation_augmentations,
+        reorder=requires_resampling,
+        resample=suggested_voxelsize
+    )
+    dls_valid_eval = fastMONAI.vision_all.DataLoaders.from_dblock(dblock_valid_eval, df.iloc[valid_index], bs=1, sampler=fastMONAI.vision_all.SequentialSampler)
+    for x, y in dls_valid_eval.train:
+        pred = torch.argmax(learn.model(x), dim=1).unsqueeze(1).to(dtype=torch.float)
+        correct_markers.accumulate(pred=pred.cpu(), targ=y.cpu())
 
-loss, *metrics = learn.validate(ds_idx=0, dl=dls_valid_eval.train)
+    marker_tps = correct_markers.overlap_count
+    marker_fps = correct_markers.pred_marker_count - correct_markers.overlap_count
+    marker_fns = correct_markers.targ_marker_count - correct_markers.overlap_count
 
-# %%
-# get predictions
-dls_valid_eval = fastMONAI.vision_all.DataLoaders.from_dblock(dblock_valid_eval, df.iloc[valid_index], bs=len(dls_valid_eval.train_ds), sampler=fastMONAI.vision_all.SequentialSampler)
-subject_idx = dls_valid_eval.train.items.loc[valid_index_i][dls_valid_eval.train.items.loc[valid_index_i]['in_files'].str.contains(subject_name)].index[0]
-subject_i = dls_valid_eval.train.items.index.get_loc(subject_idx)
+    marker_precision = (marker_tps / (marker_tps + marker_fps)) if (marker_tps + marker_fps) > 0 else 0
+    marker_recall = (marker_tps / (marker_tps + marker_fns))  if (marker_tps + marker_fns) > 0 else 0
 
-# %%
-x, y = list(dls_valid_eval.train)[0]
-pred = learn.model(x).unsqueeze(1).to(dtype=torch.float)
-pred_data = torch.Tensor(pred)
-pred_empty = pred_data[subject_i,0,0,:,:,:]
-pred_seed = pred_data[subject_i,0,1,:,:,:]
-pred_calc = pred_data[subject_i,0,2,:,:,:]
-pred_seg = torch.argmax(pred_data[subject_i,0,:,:,:], dim=0)
+    loss, *metrics = learn.validate(ds_idx=0, dl=dls_valid_eval.train)
 
-# %%
-def pad_tensor(input_tensor, target_size, interpolation='trilinear'):
-    # Calculate padding for each dimension
-    pad_depth = max(0, target_size[0] - input_tensor.shape[0])
-    pad_height = max(0, target_size[1] - input_tensor.shape[1])
-    pad_width = max(0, target_size[2] - input_tensor.shape[2])
+    # get predictions
+    dls_valid_eval = fastMONAI.vision_all.DataLoaders.from_dblock(dblock_valid_eval, df.iloc[valid_index], bs=len(dls_valid_eval.train_ds), sampler=fastMONAI.vision_all.SequentialSampler)
+    subject_idx = dls_valid_eval.train.items.loc[valid_index_i][dls_valid_eval.train.items.loc[valid_index_i]['in_files'].str.contains(subject_name)].index[0]
+    subject_i = dls_valid_eval.train.items.index.get_loc(subject_idx)
 
-    # Apply padding
-    padded_tensor = torch.nn.functional.pad(input_tensor, (pad_width//2, pad_width//2, pad_height//2, pad_height//2, pad_depth//2, pad_depth//2))
+    x, y = list(dls_valid_eval.train)[0]
+    pred = learn.model(x).unsqueeze(1).to(dtype=torch.float)
+    pred_data = torch.Tensor(pred)
+    pred_empty = pred_data[subject_i,0,0,:,:,:]
+    pred_seed = pred_data[subject_i,0,1,:,:,:]
+    pred_calc = pred_data[subject_i,0,2,:,:,:]
+    pred_seg = torch.argmax(pred_data[subject_i,0,:,:,:], dim=0)
 
-    if any(i < j for i, j in zip(target_size, padded_tensor.shape)):
-        # Reshaping tensor shape for 5D input to F.interpolate()
-        padded_tensor = padded_tensor.unsqueeze(0).unsqueeze(0).float() # convert to float
+    pred_empty = pad_or_crop_tensor(pred_empty, (146, 160, 60))
+    pred_seed = pad_or_crop_tensor(pred_seed, (146, 160, 60))
+    pred_calc = pad_or_crop_tensor(pred_calc, (146, 160, 60))
+    pred_seg = pad_or_crop_tensor(pred_seg.cpu(), (146, 160, 60), interpolation='nearest')
 
-        # Use interpolation to resample
-        if interpolation == 'nearest':
-            resampled_tensor = torch.nn.functional.interpolate(padded_tensor, size=target_size, mode='nearest')
-        else:
-            resampled_tensor = torch.nn.functional.interpolate(padded_tensor, size=target_size, mode='trilinear', align_corners=False)
-
-        # Convert back to original dtype, if needed
-        resampled_tensor = resampled_tensor.to(input_tensor.dtype)
-
-        # Remove added dimensions
-        resampled_tensor = resampled_tensor.squeeze(0).squeeze(0)
-
-        return resampled_tensor
-    
-    return padded_tensor
-
-# %%
-pred_empty = pad_tensor(pred_empty, (146, 160, 60))
-pred_seed = pad_tensor(pred_seed, (146, 160, 60))
-pred_calc = pad_tensor(pred_calc, (146, 160, 60))
-pred_seg = pad_tensor(pred_seg.cpu(), (146, 160, 60), interpolation='nearest')
-
-# %%
-nii = nib.load(dls_valid_eval.train.items['in_files'].loc[subject_idx].split(';')[0])
-nib.save(nib.Nifti1Image(dataobj=pred_seed.cpu().detach().numpy(), affine=nii.affine, header=nii.header), f"{subject_name}_pred_seed.nii")
-nib.save(nib.Nifti1Image(dataobj=pred_calc.cpu().detach().numpy(), affine=nii.affine, header=nii.header), f"{subject_name}_pred_calc.nii")
-nib.save(nib.Nifti1Image(dataobj=pred_empty.cpu().detach().numpy(), affine=nii.affine, header=nii.header), f"{subject_name}_pred_empty.nii")
-nib.save(nib.Nifti1Image(dataobj=pred_seg.cpu().detach().numpy(), affine=nii.affine, header=nii.header), f"{subject_name}_pred_seg.nii")
+    nii = nib.load(dls_valid_eval.train.items['in_files'].loc[subject_idx].split(';')[0])
+    extra_data_dir = os.path.join(session_dir, "extra_data")
+    nib.save(nib.Nifti1Image(dataobj=pred_seed.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_seed.nii"))
+    nib.save(nib.Nifti1Image(dataobj=pred_calc.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_calc.nii"))
+    nib.save(nib.Nifti1Image(dataobj=pred_empty.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_empty.nii"))
+    nib.save(nib.Nifti1Image(dataobj=pred_seg.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_seg.nii"))
 
 
 # %%

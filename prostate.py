@@ -2,13 +2,104 @@ import fastMONAI.vision_all
 import torch
 import fastai
 import numpy as np
-import scipy.ndimage
-from skimage.measure import label, regionprops
+import enum
+import skimage.measure # label, regionprops
+import scipy.ndimage # label
 from matplotlib import pyplot as plt
 
+class SegTypeRaw(enum.Enum):
+    NO_LABEL = 0
+    PROSTATE = 1
+    GOLD_SEED = 2
+    CALCIFICATION = 3
+
+class SegTypeClean(enum.Enum):
+    NO_LABEL = 0
+    GOLD_SEED = 1
+    CALCIFICATION = 2
+
+def get_centroids(mask):
+    labeled_mask, num_labels = scipy.ndimage.label(
+        input=mask,
+        structure=np.ones((3, 3, 3))
+    )
+
+    centroids = []
+
+    for region_label in range(1, num_labels+1):
+        coords = np.argwhere(labeled_mask == region_label)
+
+        centroid = np.mean(coords, axis=0)
+        centroid = np.round(centroid).astype(int)
+        centroids.append(centroid)
+
+    return centroids
+
+def get_cropped_regions(mask, vals, cropsize=10):
+    
+    labeled_mask, num_labels = scipy.ndimage.label(
+        input=mask,
+        structure=np.ones((3, 3, 3))
+    )
+
+    cropped_regions = []
+    cropped_masks = []
+
+    for region_label in range(1, num_labels+1):
+        coords = np.argwhere(labeled_mask == region_label)
+
+        centroid = np.mean(coords, axis=0)
+        centroid = np.round(centroid).astype(int)
+
+        half_cropsize = cropsize // 2
+
+        submask = mask[
+            centroid[0]-half_cropsize:centroid[0]+half_cropsize,
+            centroid[1]-half_cropsize:centroid[1]+half_cropsize,
+            centroid[2]-half_cropsize:centroid[2]+half_cropsize
+        ]
+        subvals = vals[
+            centroid[0]-half_cropsize:centroid[0]+half_cropsize,
+            centroid[1]-half_cropsize:centroid[1]+half_cropsize,
+            centroid[2]-half_cropsize:centroid[2]+half_cropsize
+        ]
+
+        cropped_regions.append(subvals)
+        cropped_masks.append(submask)
+
+    return cropped_regions, cropped_masks
+
+def get_region_stats(seg, vals):
+    counts = {}
+    means = {}
+    stds = {}
+
+    for label_id in np.unique(seg):
+        if label_id == 0: continue
+        
+        labels, num_labels = scipy.ndimage.label(
+            seg * np.array((seg == label_id), int),
+            structure=np.ones((3, 3, 3))
+        )
+
+        region_counts = []
+        region_means = []
+        region_stds = []
+        for i in range(1, num_labels+1):
+            mask = (labels == i)
+            region_counts.append(np.sum(mask))
+            region_means.append(np.mean(vals[mask]))
+            region_stds.append(np.std(vals[mask]))
+
+        counts[label_id] = region_counts
+        means[label_id] = region_means
+        stds[label_id] = region_stds
+
+    return counts, means, stds
+
 def get_center_slices(mask):
-    labeled_mask = label(mask)
-    regions = regionprops(labeled_mask)
+    labeled_mask = skimage.measure.label(mask)
+    regions = skimage.measure.regionprops(labeled_mask)
     center_slices = [[round(coord) for coord in region.centroid] for region in regions]
     return center_slices
 

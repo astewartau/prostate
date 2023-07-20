@@ -103,6 +103,7 @@ model_data = {
     'QSM-T1-T2s' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]};{t2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'QSM-T1-R2s' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]};{r2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'QSM-T1' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
+    'QSM-SWI' : { 'in_files' : [f"{qsm_files[i]};{swi_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'QSM' : { 'in_files' : [f"{qsm_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'SWI' : { 'in_files' : [f"{swi_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'T1' : { 'in_files' : [f"{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
