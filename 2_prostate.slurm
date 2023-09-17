@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --partition=ai
+#SBATCH --partition=gpu_cuda
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=10
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --mem=100G
 #SBATCH --time=04:00:00
 #SBATCH --account=a_barth

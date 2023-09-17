@@ -19,20 +19,15 @@ import sys
 
 import pandas as pd
 import numpy as np
-import nibabel as nib
 
 import random
-import fastai
 import fastcore.transform
 import fastMONAI.vision_all
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
-from monai.transforms import MapTransform
 from sklearn.model_selection import KFold
 
 import scipy.ndimage 
-from sklearn.model_selection import train_test_split
-from skimage.measure import label, regionprops
 
 from useful_functions import *
 from prostate import *
@@ -45,7 +40,7 @@ session_dirs = []
 for json_path in sorted(glob.glob(os.path.join(bids_dir, "sub*", "ses*", "anat", "*echo-01*mag*json"))):
     with open(json_path, 'r') as json_file:
         json_data = json.load(json_file)
-        if json_data['ProtocolName'] == "t2starME_qsm_tra_Iso1.4mm_INPHASE_bipolar_RUN_THIS_ONE":
+        if json_data['ProtocolName'] in ["t2starME_qsm_tra_Iso1.4mm_INPHASE_bipolar_RUN_THIS_ONE"]:#, "wip_iSWI_fl3d_vibe", "wip_iSWI_fl3d_vibe_TRY THIS ONE"]:
             session_dirs.append(os.sep.join(os.path.split(json_path)[0].split(os.sep)[:-1]))
 print(f"{len(session_dirs)} sessions found")
 
@@ -55,11 +50,12 @@ session_dirs
 # %%
 extra_files = sum((glob.glob(os.path.join(session_dir, "extra_data", "*.nii*")) for session_dir in session_dirs), [])
 
+qsm_files2 = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*qsm.*")) for session_dir in session_dirs), []))
 qsm_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*qsm_echo2-and-echo4.*")) for session_dir in session_dirs), []))
-t2s_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*t2starmap.nii*")) for session_dir in session_dirs), []))
-r2s_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*r2starmap.nii*")) for session_dir in session_dirs), []))
+t2s_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*t2s*.nii*")) for session_dir in session_dirs), []))
+r2s_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*r2s*.nii*")) for session_dir in session_dirs), []))
 mag_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "magnitude_combined.nii")) for session_dir in session_dirs), []))
-swi_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "swi.nii")) for session_dir in session_dirs), []))
+swi_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*swi.nii")) for session_dir in session_dirs), []))
 
 gre_seg_raw_files = [extra_file for extra_file in extra_files if all(pattern in extra_file for pattern in ['_segmentation.', 'run'])]
 gre_seg_clean_files = [seg_file.replace(".nii", "_clean.nii") for seg_file in gre_seg_raw_files if os.path.exists(seg_file.replace(".nii", "_clean.nii"))]
@@ -70,12 +66,13 @@ t1_resampled_files = [t1_file.replace(".nii", "_resampled.nii") for t1_file in t
 
 ct_files = [extra_file for extra_file in extra_files if 'resliced' in extra_file and any(pattern in extra_file for pattern in ['_na_', '_Pelvis_', '_NA']) and not any(pattern in extra_file for pattern in ['_t1_tra_', 'ATX', 'AXT', 'ROI', 'segmentation', '.json'])]
 ct_seg_raw_files = sum((glob.glob(ct_file.replace(".nii", "_segmentation.nii")) for ct_file in ct_files), [])
-ct_seg_clean_files = [ct_file.replace("_segmentation", "_segmentation_clean") for ct_file in ct_seg_raw_files if os.path.exists(ct_file)]
+ct_seg_clean_files = [ct_file.replace("_segmentation", "_segmentation_clean") for ct_file in ct_seg_raw_files if os.path.exists(ct_file.replace("_segmentation", "_segmentation_clean"))]
 
 print(f"{len(ct_files)} CT images found.")
 print(f"{len(ct_seg_raw_files)} raw CT segmentations found.")
 print(f"{len(ct_seg_clean_files)} clean CT segmentations found.")
 print(f"{len(qsm_files)} QSM images found.")
+print(f"{len(qsm_files2)} QSM (2) images found.")
 print(f"{len(mag_files)} magnitude images found.")
 print(f"{len(t2s_files)} T2* maps found.")
 print(f"{len(r2s_files)} R2* maps found.")
@@ -100,14 +97,12 @@ assert(len(ct_files) == len(ct_seg_clean_files))
 # %%
 model_data = {
     'CT' : { 'in_files' : [f"{ct_files[i]}" for i in range(len(ct_files))], 'seg_files': ct_seg_clean_files },
-    'QSM-T1-T2s' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]};{t2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'QSM-T1-R2s' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]};{r2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'QSM-T1' : { 'in_files' : [f"{qsm_files[i]};{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'QSM-SWI' : { 'in_files' : [f"{qsm_files[i]};{swi_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'QSM' : { 'in_files' : [f"{qsm_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'SWI' : { 'in_files' : [f"{swi_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'T1' : { 'in_files' : [f"{t1_resampled_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
-    'T2s' : { 'in_files' : [f"{t2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'R2s' : { 'in_files' : [f"{r2s_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
     'GRE' : { 'in_files' : [f"{mag_files[i]}" for i in range(len(qsm_files))], 'seg_files': gre_seg_clean_files },
 }
@@ -135,9 +130,10 @@ class AugmentMarkers(fastcore.transform.ItemTransform):
         return (fastMONAI.vision_all.MedImage(x), y)
 
 # %%
+print(f"=== {sys.argv[1]}-{sys.argv[2]} ===")
 model_name = sys.argv[1]
 fold_id = int(sys.argv[2])
-k_folds = 24
+k_folds = 26
 random_state = 42
 timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d-%H%M%S')
 
