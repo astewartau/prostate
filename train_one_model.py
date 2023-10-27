@@ -1,5 +1,45 @@
 # %%
+
+import glob
+import os
+import json
+import time
+import datetime
+import sys
+
 import torch
+import pandas as pd
+
+import fastMONAI.vision_all
+from monai.networks.nets import UNet
+from monai.losses import DiceCELoss
+from sklearn.model_selection import KFold
+
+from useful_functions import *
+from prostate import *
+
+# %%
+sys.argv = ['.', 'QSM', 1]
+print(f"=== {sys.argv[1]}-{sys.argv[2]} ===")
+model_name = sys.argv[1]
+fold_id = int(sys.argv[2])
+k_folds = 26
+random_state = 42
+timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d-%H%M%S')
+
+batch_size = 6
+training_epochs = 700
+lr = 0.003
+ce_loss_weights = torch.Tensor([1, 1, 1])
+training_augmentations = [
+    fastMONAI.vision_all.PadOrCrop([80, 80, 80]),
+    fastMONAI.vision_all.RandomFlip(axes=("LR",)),
+    fastMONAI.vision_all.RandomFlip(axes=("AP",)),
+    fastMONAI.vision_all.RandomAffine(degrees=(90, 90, 90)),
+    fastMONAI.vision_all.ZNormalization()
+]
+
+if 'QSM' in model_name: training_augmentations.append(AugmentMarkers())
 
 # %%
 if torch.cuda.is_available():
@@ -8,29 +48,6 @@ if torch.cuda.is_available():
 else:
     device = torch.device("cpu")
     print("GPU is NOT available. Fastai will use the CPU.")
-
-# %%
-import glob
-import os
-import json
-import time
-import datetime
-import sys
-
-import pandas as pd
-import numpy as np
-
-import random
-import fastcore.transform
-import fastMONAI.vision_all
-from monai.networks.nets import UNet
-from monai.losses import DiceCELoss
-from sklearn.model_selection import KFold
-
-import scipy.ndimage 
-
-from useful_functions import *
-from prostate import *
 
 # %%
 bids_dir = "bids-new"
@@ -43,9 +60,6 @@ for json_path in sorted(glob.glob(os.path.join(bids_dir, "sub*", "ses*", "anat",
         if json_data['ProtocolName'] in ["t2starME_qsm_tra_Iso1.4mm_INPHASE_bipolar_RUN_THIS_ONE"]:#, "wip_iSWI_fl3d_vibe", "wip_iSWI_fl3d_vibe_TRY THIS ONE"]:
             session_dirs.append(os.sep.join(os.path.split(json_path)[0].split(os.sep)[:-1]))
 print(f"{len(session_dirs)} sessions found")
-
-# %%
-session_dirs
 
 # %%
 extra_files = sum((glob.glob(os.path.join(session_dir, "extra_data", "*.nii*")) for session_dir in session_dirs), [])
@@ -91,9 +105,6 @@ assert(len(qsm_files) == len(mag_files))
 assert(len(qsm_files) == len(t1_resampled_files))
 assert(len(ct_files) == len(ct_seg_clean_files))
 
-# %% [markdown]
-# # Parameters
-
 # %%
 model_data = {
     'CT' : { 'in_files' : [f"{ct_files[i]}" for i in range(len(ct_files))], 'seg_files': ct_seg_clean_files },
@@ -108,48 +119,7 @@ model_data = {
 }
 
 # %%
-class AugmentMarkers(fastcore.transform.ItemTransform):
 
-    inverted_ids = []
-
-    def encodes(self, xy):
-        # convert data
-        x, y = xy
-        x = x.numpy()
-        y_np = np.array(y.numpy() == 1, dtype=int)[0,:,:,:]
-
-        # determine connected regions
-        labels, nlabels = scipy.ndimage.label(y_np, structure=scipy.ndimage.generate_binary_structure(3, 3))
-
-        # invert some markers with 5% probability
-        for i in range(nlabels):
-            if random.random() <= 0.05:
-                self.inverted_ids.append(i+1)
-                x[0,labels == i+1] *= -1
-
-        return (fastMONAI.vision_all.MedImage(x), y)
-
-# %%
-print(f"=== {sys.argv[1]}-{sys.argv[2]} ===")
-model_name = sys.argv[1]
-fold_id = int(sys.argv[2])
-k_folds = 26
-random_state = 42
-timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d-%H%M%S')
-
-batch_size = 6
-training_epochs = 700
-lr = 0.003
-ce_loss_weights = torch.Tensor([1, 1, 1])
-training_augmentations = [
-    fastMONAI.vision_all.PadOrCrop([80, 80, 80]),
-    fastMONAI.vision_all.RandomFlip(axes=("LR",)),
-    fastMONAI.vision_all.RandomFlip(axes=("AP",)),
-    fastMONAI.vision_all.RandomAffine(degrees=(90, 90, 90)),
-    fastMONAI.vision_all.ZNormalization()
-]
-
-if 'QSM' in model_name: training_augmentations.append(AugmentMarkers())
 
 # %%
 # split training/testing
@@ -203,6 +173,7 @@ learn = fastMONAI.vision_all.Learner(
     metrics=[fastMONAI.vision_all.multi_dice_score, MarkersIdentified(), SuperfluousMarkers()]#.to_fp16()
 )
 
+# %%
 start_time = time.time()
 learn.fit_flat_cos(
     training_epochs,

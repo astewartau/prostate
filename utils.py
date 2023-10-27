@@ -1,4 +1,6 @@
+import random
 import fastMONAI.vision_all
+import fastcore.transform
 import torch
 import fastai
 import numpy as np
@@ -17,6 +19,7 @@ class SegTypeClean(enum.Enum):
     NO_LABEL = 0
     GOLD_SEED = 1
     CALCIFICATION = 2
+    PROSTATE = 3
 
 def get_centroids(mask):
     labeled_mask, num_labels = scipy.ndimage.label(
@@ -45,24 +48,18 @@ def get_cropped_regions(mask, vals, cropsize=10):
     cropped_regions = []
     cropped_masks = []
 
+    half_cropsize = cropsize // 2
+
     for region_label in range(1, num_labels+1):
         coords = np.argwhere(labeled_mask == region_label)
+        centroid = np.mean(coords, axis=0).astype(int)
 
-        centroid = np.mean(coords, axis=0)
-        centroid = np.round(centroid).astype(int)
+        x_start, x_end = centroid[0]-half_cropsize, centroid[0]+half_cropsize
+        y_start, y_end = centroid[1]-half_cropsize, centroid[1]+half_cropsize
+        z_start, z_end = centroid[2]-half_cropsize, centroid[2]+half_cropsize
 
-        half_cropsize = cropsize // 2
-
-        submask = mask[
-            centroid[0]-half_cropsize:centroid[0]+half_cropsize,
-            centroid[1]-half_cropsize:centroid[1]+half_cropsize,
-            centroid[2]-half_cropsize:centroid[2]+half_cropsize
-        ]
-        subvals = vals[
-            centroid[0]-half_cropsize:centroid[0]+half_cropsize,
-            centroid[1]-half_cropsize:centroid[1]+half_cropsize,
-            centroid[2]-half_cropsize:centroid[2]+half_cropsize
-        ]
+        submask = np.array(mask[x_start:x_end, y_start:y_end, z_start:z_end], dtype=int)
+        subvals = np.array(vals[x_start:x_end, y_start:y_end, z_start:z_end], dtype=float)
 
         cropped_regions.append(subvals)
         cropped_masks.append(submask)
@@ -277,4 +274,25 @@ class SuperfluousMarkers(fastai.metrics.Metric):
     @property
     def value(self):
         return float(self.pred_marker_count - self.overlap_count) / max(1., float(self.pred_marker_count))
+
+class AugmentMarkers(fastcore.transform.ItemTransform):
+
+    inverted_ids = []
+
+    def encodes(self, xy):
+        # convert data
+        x, y = xy
+        x = x.numpy()
+        y_np = np.array(y.numpy() == 1, dtype=int)[0,:,:,:]
+
+        # determine connected regions
+        labels, nlabels = scipy.ndimage.label(y_np, structure=scipy.ndimage.generate_binary_structure(3, 3))
+
+        # invert some markers with 5% probability
+        for i in range(nlabels):
+            if random.random() <= 0.05:
+                self.inverted_ids.append(i+1)
+                x[0,labels == i+1] *= -1
+
+        return (fastMONAI.vision_all.MedImage(x), y)
 

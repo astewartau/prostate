@@ -139,7 +139,7 @@ model_data = { # CT, QSM, QSM-T1-R2s, QSM-T1, GRE, T1, SWI, R2s, T2s
 # sub-z3278008 : lots of calcification
 
 model_name = 'QSM'
-k_folds = 24
+k_folds = 26
 random_state = 42
 batch_size = 6
 ce_loss_weights = torch.Tensor([1, 1, 1])
@@ -224,6 +224,8 @@ for session_dir in session_dirs:
         opt_func=fastMONAI.vision_all.ranger,
         metrics=[fastMONAI.vision_all.multi_dice_score, MarkersIdentified(), SuperfluousMarkers()]#.to_fp16()
     )
+    print(learn.summary())
+    exit()
 
     model_file = glob.glob(f"models/{model_name}-2*-*-{i}-best*")[0].replace('models/', '').replace('.pth', '')
     learn = learn.load(model_file)
@@ -275,10 +277,10 @@ for session_dir in session_dirs:
 
     nii = nib.load(dls_valid_eval.train.items['in_files'].loc[subject_idx].split(';')[0])
     extra_data_dir = os.path.join(session_dir, "extra_data")
-    nib.save(nib.Nifti1Image(dataobj=pred_seed.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_seed.nii"))
-    nib.save(nib.Nifti1Image(dataobj=pred_calc.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_calc.nii"))
-    nib.save(nib.Nifti1Image(dataobj=pred_empty.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_empty.nii"))
-    nib.save(nib.Nifti1Image(dataobj=pred_seg.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_seg.nii"))
+    nib.save(nib.Nifti1Image(dataobj=pred_seed.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_seed2.nii"))
+    nib.save(nib.Nifti1Image(dataobj=pred_calc.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_calc2.nii"))
+    nib.save(nib.Nifti1Image(dataobj=pred_empty.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_empty2.nii"))
+    nib.save(nib.Nifti1Image(dataobj=pred_seg.cpu().detach().numpy(), affine=nii.affine, header=nii.header), os.path.join(extra_data_dir, f"{subject_name}_pred_seg2.nii"))
 
 
 # %%
