@@ -12,7 +12,8 @@ rm miniconda.sh
 conda create --name prostate python=3.8
 conda activate prostate
 conda update -n base -c defaults conda
-conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch
+#conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch
+conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
 conda install -c fastchan fastai
 conda install ipykernel ipywidgets
 #conda install -c conda-forge gxx_linux-64=11.1.0

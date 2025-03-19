@@ -1,5 +1,6 @@
 import random
 import fastMONAI.vision_all
+import fastai.metrics
 import fastcore.transform
 import torch
 import fastai
@@ -170,58 +171,111 @@ def show_results(x:fastMONAI.vision_all.MedImage, y:fastMONAI.vision_all.MedMask
     show_images(x, y, fig_out=f"{fig_out.split('.')[0]}_targ.png")
     show_images(x, outs, fig_out=f"{fig_out.split('.')[0]}_pred.png")
     
-
 class MarkersIdentified(fastai.metrics.Metric):
     def __init__(self):
         super().__init__()
         self.targ_marker_count = 0
         self.pred_marker_count = 0
         self.overlap_count = 0
+        self.misclassified_marker_count = 0  # Predicted markers overlapping calcification only
     
     def reset(self):
         self.targ_marker_count = 0
         self.pred_marker_count = 0
         self.overlap_count = 0
-    
+        self.misclassified_marker_count = 0
+
+    def _process_volume(self, pred_vol, targ_vol, calc_vol, structure):
+        """
+        Process a single 3D volume (predicted markers, target markers, and calcifications).
+        Returns:
+            pred_nlabels: number of predicted marker objects in pred_vol
+            targ_nlabels: number of gold marker objects in targ_vol
+            n_overlaps: number of predicted marker objects overlapping the gold markers
+            misclassified: number of predicted marker objects overlapping calcification 
+                           without overlapping the gold marker.
+        """
+        # Label predicted markers and target markers.
+        pred_labels, pred_nlabels = scipy.ndimage.label(pred_vol, structure=structure)
+        _, targ_nlabels = scipy.ndimage.label(targ_vol, structure=structure)
+
+        if pred_nlabels > 3:
+            # Measure sizes of labeled regions
+            sizes = np.bincount(pred_labels.ravel())[1:]  # Skip background count
+            largest_labels = np.argsort(sizes)[-3:] + 1  # Get top 3 largest labels (1-based)
+
+            # Create new volume keeping only the largest 3 components
+            pred_vol = np.isin(pred_labels, largest_labels).astype(pred_vol.dtype)
+
+            # Recompute the labels based on the filtered volume
+            pred_labels, pred_nlabels = scipy.ndimage.label(pred_vol, structure=structure)
+
+        # Compute overlap between predicted and gold marker.
+        overlap = np.logical_and(pred_vol == targ_vol, pred_vol == 1)
+        _, n_overlaps = scipy.ndimage.label(overlap, structure=structure)
+        
+        # For misclassification, label the predicted marker objects.
+        labeled_pred, num_pred_objects = scipy.ndimage.label(pred_vol == 1, structure=structure)
+        misclassified = 0
+        for label in range(1, num_pred_objects + 1):
+            component = (labeled_pred == label)
+            # If component overlaps calcification AND does not overlap gold marker.
+            if np.any(component & calc_vol) and not np.any(component & targ_vol):
+                misclassified += 1
+        return pred_nlabels, targ_nlabels, n_overlaps, misclassified
+
     def accumulate(self, learn=None, pred=None, targ=None):
         if pred is None or targ is None:
             pred = learn.pred.argmax(dim=1).cpu().numpy()
             targ = learn.y.cpu().numpy()
-        
-        pred = np.array(np.round(pred) == 1, dtype=int)
-        targ = np.array(np.round(targ) == 1, dtype=int)
+        else:
+            pred = pred.cpu().numpy() if hasattr(pred, "cpu") else pred
+            targ = targ.cpu().numpy() if hasattr(targ, "cpu") else targ
 
-        pred = scipy.ndimage.binary_dilation(pred)
-        targ = scipy.ndimage.binary_dilation(targ)
+        # Prepare binary maps.
+        # Use ground truth targ for markers (class==1) and calcifications (class==2)
+        pred_marker = np.array(np.round(pred) == 1, dtype=int)
+        targ_marker = np.array(np.round(targ) == 1, dtype=int)
+        targ_calc = np.array(np.round(targ) == 2, dtype=int)
+
+        # Apply binary dilation.
+        pred_marker = scipy.ndimage.binary_dilation(pred_marker)
+        targ_marker = scipy.ndimage.binary_dilation(targ_marker)
+        targ_calc = scipy.ndimage.binary_dilation(targ_calc)
 
         structure = np.ones((3, 3, 3)) == True
 
-        for i in range(pred.shape[0]):
-            if len(pred[i].shape) == 3:
-                _, pred_nlabels = scipy.ndimage.label(pred[i], structure=structure)
-                _, targ_nlabels = scipy.ndimage.label(targ[i][0], structure=structure)
-
-                overlap = np.array(np.logical_and(pred[i] == targ[i][0], pred[i] == 1), dtype=int)
-                _, n_overlaps = scipy.ndimage.label(overlap, structure=structure)
-                
+        # Process each sample.
+        for i in range(pred_marker.shape[0]):
+            # If sample is a 3D volume (assume target has an extra channel, so targ_marker[i][0])
+            if pred_marker[i].ndim == 3:
+                p_vol = pred_marker[i]
+                t_vol = targ_marker[i][0]
+                c_vol = targ_calc[i][0]
+                pred_nlabels, targ_nlabels, n_overlaps, misclassified = self._process_volume(p_vol, t_vol, c_vol, structure)
                 self.pred_marker_count += pred_nlabels
                 self.targ_marker_count += targ_nlabels
                 self.overlap_count += n_overlaps
+                self.misclassified_marker_count += misclassified
             else:
-                for j in range(pred[i].shape[0]):
-                    _, pred_nlabels = scipy.ndimage.label(pred[i][j], structure=structure)
-                    _, targ_nlabels = scipy.ndimage.label(targ[i][j], structure=structure)
-                
-                    overlap = np.array(np.logical_and(pred[i][j] == targ[i][j], pred[i][j] == 1), dtype=int)
-                    _, n_overlaps = scipy.ndimage.label(overlap, structure=structure)
-                    
+                # Otherwise, assume sample has an extra dimension (multiple channels)
+                for j in range(pred_marker[i].shape[0]):
+                    p_vol = pred_marker[i][j]
+                    t_vol = targ_marker[i][j]
+                    c_vol = targ_calc[i][j]
+                    pred_nlabels, targ_nlabels, n_overlaps, misclassified = self._process_volume(p_vol, t_vol, c_vol, structure)
                     self.pred_marker_count += pred_nlabels
                     self.targ_marker_count += targ_nlabels
                     self.overlap_count += n_overlaps
+                    self.misclassified_marker_count += misclassified
 
     @property
     def value(self):
         return float(self.overlap_count) / max(1., float(self.targ_marker_count))
+    
+    @property
+    def calcification_misclassifications(self):
+        return self.misclassified_marker_count
 
 class SuperfluousMarkers(fastai.metrics.Metric):
     def __init__(self):

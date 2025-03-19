@@ -1,3 +1,11 @@
+print("In Python")
+
+# replace print so it always flushes
+def print(*args, **kwargs):
+    __builtins__.print(*args, **kwargs, flush=True)
+
+print("Importing libraries...")
+
 import glob
 import os
 import json
@@ -33,7 +41,7 @@ ce_loss_weights = torch.Tensor([1, 1, 1])
 
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
-    print("GPU is available. Using GPU.")
+    print(f"GPU is available. Using GPU: {torch.cuda.get_device_name(0)}")
 else:
     device = torch.device("cpu")
     print("GPU is NOT available. Using CPU.")
@@ -149,7 +157,7 @@ class RandomIntensityShift(tio.Transform):
         for image_name in subject.keys():
             # Apply only to scalar images (skip label maps)
             if isinstance(subject[image_name], tio.ScalarImage):
-                img_tensor = subject[image_name].data  # shape: (1, D, H, W) or (D, H, W)
+                img_tensor = subject[image_name].data  # (1, D, H, W) or (D, H, W)
                 if img_tensor.ndim == 3:
                     img_tensor = img_tensor.unsqueeze(0)
                 gamma = np.random.uniform(*self.gamma_range)
@@ -157,23 +165,27 @@ class RandomIntensityShift(tio.Transform):
                 subject[image_name].set_data(img_tensor)
         return subject
 
-# --- Helper function to merge input channels ---
-def merge_input_channels(subject, infile_cols):
-    # Check if subject already contains a merged image
-    if 'image' in subject.get_images_names():
+# --- Custom transform: Merge Input Channels ---
+class MergeInputChannels(tio.Transform):
+    def __init__(self, infile_cols):
+        super().__init__()
+        self.infile_cols = infile_cols
+
+    def apply_transform(self, subject):
+        input_tensors = []
+        for col in self.infile_cols:
+            if col not in subject:
+                continue
+            tensor = subject[col].data
+            if tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            input_tensors.append(tensor)
+        if not input_tensors:
+            return subject
+        merged = torch.cat(input_tensors, dim=0)
+        subject['image'] = tio.ScalarImage(tensor=merged, affine=subject[self.infile_cols[0]].affine)
+        subject['mask'] = subject['seg']
         return subject
-    input_tensors = []
-    for col in infile_cols:
-        if col not in subject:
-            continue
-        tensor = subject[col].data
-        if tensor.ndim == 3:
-            tensor = tensor.unsqueeze(0)
-        input_tensors.append(tensor)
-    merged = torch.cat(input_tensors, dim=0)
-    subject.add_image(tio.ScalarImage(tensor=merged, affine=subject[infile_cols[0]].affine), 'image')
-    subject['mask'] = subject['seg']
-    return subject
 
 # --- Build training transforms ---
 if model_name == "T1":
@@ -183,7 +195,7 @@ if model_name == "T1":
         tio.RandomFlip(axes=(0, 1)),
         tio.RandomAffine(degrees=(90, 90, 90)),
         tio.ZNormalization(),
-        tio.Lambda(lambda subject: merge_input_channels(subject, infile_cols))
+        MergeInputChannels(infile_cols)
     ])
 else:
     training_transforms = tio.Compose([
@@ -191,7 +203,7 @@ else:
         tio.RandomFlip(axes=(0, 1)),
         tio.RandomAffine(degrees=(90, 90, 90)),
         tio.ZNormalization(),
-        tio.Lambda(lambda subject: merge_input_channels(subject, infile_cols))
+        MergeInputChannels(infile_cols)
     ])
 
 if 'QSM' in model_name:
@@ -220,8 +232,14 @@ class TorchIODatasetWrapper(torch.utils.data.Dataset):
         return len(self.subjects_dataset)
     def __getitem__(self, index):
         subject = self.subjects_dataset[index]
+        if 'image' not in subject:
+            raise KeyError("Missing 'image' key in subject")
         image = subject['image'].data  # (C, D, H, W)
+        if 'mask' not in subject:
+            raise KeyError("Missing 'mask' key in subject")
         mask = subject['mask'].data.squeeze(0)  # (D, H, W)
+        # Convert mask to Long for loss functions
+        mask = mask.long()
         return image, mask
 
 train_dataset = TorchIODatasetWrapper(train_subjects_dataset)

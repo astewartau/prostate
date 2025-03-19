@@ -1,3 +1,13 @@
+#!/usr/bin/env python
+
+print("In Python")
+
+# replace print so it always flushes
+def print(*args, **kwargs):
+    __builtins__.print(*args, **kwargs, flush=True)
+
+print("Importing libraries...")
+
 import glob
 import os
 import json
@@ -18,6 +28,7 @@ import scipy.ndimage
 import matplotlib.pyplot as plt
 
 from sklearn.model_selection import KFold
+from skimage.measure import marching_cubes, mesh_surface_area
 
 # --- Command-line arguments and settings ---
 print(f"=== {sys.argv[1]}-{sys.argv[2]} ===")
@@ -25,15 +36,17 @@ model_name = sys.argv[1]
 fold_id = int(sys.argv[2])
 random_state = 42
 timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d-%H%M%S')
+model_instance = f"{model_name}-{timestamp}-{fold_id}"
+print(f"Model instance: {model_instance}")
 
 batch_size = 6
-training_epochs = 700
+training_epochs = 4000
 lr = 0.003
 ce_loss_weights = torch.Tensor([1, 1, 1])
 
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
-    print("GPU is available. Using GPU.")
+    print(f"GPU is available. Using GPU: {torch.cuda.get_device_name(0)}")
 else:
     device = torch.device("cpu")
     print("GPU is NOT available. Using CPU.")
@@ -147,9 +160,8 @@ class RandomIntensityShift(tio.Transform):
         if torch.rand(1).item() > self.p:
             return subject
         for image_name in subject.keys():
-            # Apply only to scalar images (skip label maps)
             if isinstance(subject[image_name], tio.ScalarImage):
-                img_tensor = subject[image_name].data  # shape: (1, D, H, W) or (D, H, W)
+                img_tensor = subject[image_name].data
                 if img_tensor.ndim == 3:
                     img_tensor = img_tensor.unsqueeze(0)
                 gamma = np.random.uniform(*self.gamma_range)
@@ -157,23 +169,27 @@ class RandomIntensityShift(tio.Transform):
                 subject[image_name].set_data(img_tensor)
         return subject
 
-# --- Helper function to merge input channels ---
-def merge_input_channels(subject, infile_cols):
-    # Check if subject already contains a merged image
-    if 'image' in subject.get_images_names():
+# --- Custom transform: Merge Input Channels ---
+class MergeInputChannels(tio.Transform):
+    def __init__(self, infile_cols):
+        super().__init__()
+        self.infile_cols = infile_cols
+
+    def apply_transform(self, subject):
+        input_tensors = []
+        for col in self.infile_cols:
+            if col not in subject:
+                continue
+            tensor = subject[col].data
+            if tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            input_tensors.append(tensor)
+        if not input_tensors:
+            return subject
+        merged = torch.cat(input_tensors, dim=0)
+        subject['image'] = tio.ScalarImage(tensor=merged, affine=subject[self.infile_cols[0]].affine)
+        subject['mask'] = subject['seg']
         return subject
-    input_tensors = []
-    for col in infile_cols:
-        if col not in subject:
-            continue
-        tensor = subject[col].data
-        if tensor.ndim == 3:
-            tensor = tensor.unsqueeze(0)
-        input_tensors.append(tensor)
-    merged = torch.cat(input_tensors, dim=0)
-    subject.add_image(tio.ScalarImage(tensor=merged, affine=subject[infile_cols[0]].affine), 'image')
-    subject['mask'] = subject['seg']
-    return subject
 
 # --- Build training transforms ---
 if model_name == "T1":
@@ -183,7 +199,7 @@ if model_name == "T1":
         tio.RandomFlip(axes=(0, 1)),
         tio.RandomAffine(degrees=(90, 90, 90)),
         tio.ZNormalization(),
-        tio.Lambda(lambda subject: merge_input_channels(subject, infile_cols))
+        MergeInputChannels(infile_cols)
     ])
 else:
     training_transforms = tio.Compose([
@@ -191,7 +207,7 @@ else:
         tio.RandomFlip(axes=(0, 1)),
         tio.RandomAffine(degrees=(90, 90, 90)),
         tio.ZNormalization(),
-        tio.Lambda(lambda subject: merge_input_channels(subject, infile_cols))
+        MergeInputChannels(infile_cols)
     ])
 
 if 'QSM' in model_name:
@@ -220,8 +236,13 @@ class TorchIODatasetWrapper(torch.utils.data.Dataset):
         return len(self.subjects_dataset)
     def __getitem__(self, index):
         subject = self.subjects_dataset[index]
+        if 'image' not in subject:
+            raise KeyError("Missing 'image' key in subject")
         image = subject['image'].data  # (C, D, H, W)
+        if 'mask' not in subject:
+            raise KeyError("Missing 'mask' key in subject")
         mask = subject['mask'].data.squeeze(0)  # (D, H, W)
+        mask = mask.long()  # Ensure mask is Long for cross_entropy
         return image, mask
 
 train_dataset = TorchIODatasetWrapper(train_subjects_dataset)
@@ -293,6 +314,53 @@ def dice_loss(pred, target, eps=1e-5):
 def combined_loss(pred, target):
     return ce_loss_fn(pred, target) + dice_loss(pred, target)
 
+# --- Prior loss function: count-aware, size, and sphericity-based roundness ---
+def compute_prior_losses(outputs):
+    # Use argmax to obtain the final segmentation (assumes class 1 is the marker)
+    segmentation = torch.argmax(outputs, dim=1).detach().cpu().numpy()
+    B = segmentation.shape[0]
+    batch_count_loss = 0
+    batch_size_loss = 0
+    batch_round_loss = 0
+    for i in range(B):
+        # Binary mask where class 1 is marked as foreground
+        binary_mask = (segmentation[i] == 1).astype(np.uint8)
+        labeled, num_components = scipy.ndimage.label(binary_mask)
+        count_loss = (num_components - 3)**2
+        size_loss = 0
+        round_loss = 0
+        for comp in range(1, num_components + 1):
+            comp_mask = (labeled == comp).astype(np.uint8)
+            vol = comp_mask.sum()
+            # Size penalty: zero if within [15,80]
+            if vol < 15:
+                size_penalty = (15 - vol)**2
+            elif vol > 80:
+                size_penalty = (vol - 80)**2
+            else:
+                size_penalty = 0
+            size_loss += size_penalty
+            # Compute surface area using marching cubes if possible
+            try:
+                verts, faces, normals, values = marching_cubes(comp_mask.astype(np.float32), level=0.5)
+                area = mesh_surface_area(verts, faces)
+                sphericity = (np.pi**(1/3) * (6 * vol)**(2/3)) / area
+                round_penalty = (1 - sphericity)**2
+            except Exception as e:
+                print(f"Marching cubes failed for component {comp} with error: {e}")
+                round_penalty = 1.0
+            round_loss += round_penalty
+        if num_components > 0:
+            size_loss /= num_components
+            round_loss /= num_components
+        batch_count_loss += count_loss
+        batch_size_loss += size_loss
+        batch_round_loss += round_loss
+    batch_count_loss /= B
+    batch_size_loss /= B
+    batch_round_loss /= B
+    return batch_count_loss, batch_size_loss, batch_round_loss
+
 # --- Metric helper functions using connected components ---
 def process_volume(pred_vol, targ_vol, calc_vol, structure):
     pred_labels, pred_nlabels = scipy.ndimage.label(pred_vol, structure=structure)
@@ -344,6 +412,11 @@ def compute_metrics(pred, targ):
          "misclassified": total_misclassified
     }
 
+# Hyperparameters for prior losses
+lambda_count = 0.001
+lambda_size = 0.001
+lambda_round = 0.001
+
 # --- Prepare lists for loss plotting ---
 train_loss_list = []
 valid_loss_list = []
@@ -354,8 +427,17 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_epoch
 
 best_valid_loss = float('inf')
 epochs_no_improve = 0
-patience = 200
+patience = 300
 
+# Define column names
+log_filename = f"{model_instance}-training.csv"
+columns = [
+    "Epoch", "Set", "CE", "Dice", "λ₁ ⋅ CountLoss", "λ₂ ⋅ SizeLoss", "λ₃ ⋅ RoundLoss",
+    "Total Loss", "Markers Found", "TPs", "FNs", "FPs", "Misclassified Calcs"
+]
+df_log = pd.DataFrame(columns=columns)
+
+print("Starting training loop...")
 start_time = time.time()
 for epoch in range(training_epochs):
     model.train()
@@ -364,10 +446,13 @@ for epoch in range(training_epochs):
         images, masks = images.to(device), masks.to(device)
         optimizer.zero_grad()
         outputs = model(images)
-        loss = combined_loss(outputs, masks)
-        loss.backward()
+        base_loss = combined_loss(outputs, masks)
+        count_loss, size_loss, round_loss = compute_prior_losses(outputs)
+        prior_loss = lambda_count * count_loss + lambda_size * size_loss + lambda_round * round_loss
+        total_loss = base_loss + torch.tensor(prior_loss, device=device, dtype=torch.float32)
+        total_loss.backward()
         optimizer.step()
-        train_loss += loss.item() * images.size(0)
+        train_loss += total_loss.item() * images.size(0)
     train_loss /= len(train_loader.dataset)
     
     model.eval()
@@ -378,8 +463,11 @@ for epoch in range(training_epochs):
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
-            loss = combined_loss(outputs, masks)
-            valid_loss += loss.item() * images.size(0)
+            base_loss = combined_loss(outputs, masks)
+            count_loss, size_loss, round_loss = compute_prior_losses(outputs)
+            prior_loss = lambda_count * count_loss + lambda_size * size_loss + lambda_round * round_loss
+            total_loss = base_loss + torch.tensor(prior_loss, device=device, dtype=torch.float32)
+            valid_loss += total_loss.item() * images.size(0)
             preds = torch.argmax(outputs, dim=1)
             all_preds.append(preds.cpu().numpy())
             all_targs.append(masks.cpu().numpy())
@@ -388,14 +476,28 @@ for epoch in range(training_epochs):
     all_targs = np.concatenate(all_targs, axis=0)
     
     metrics = compute_metrics(all_preds, all_targs)
-    
+
+    # Format results for DataFrame
+    new_rows = [
+        [epoch+1, "Train", ce_loss_fn(outputs, masks).item(), dice_loss(outputs, masks).item(),
+         lambda_count * count_loss, lambda_size * size_loss, lambda_round * round_loss,
+         train_loss, metrics['actual_markers'], metrics['true_positive'],
+         metrics['false_negative'], metrics['false_positive'], metrics['misclassified']],
+        
+        [epoch+1, "Validation", ce_loss_fn(outputs, masks).item(), dice_loss(outputs, masks).item(),
+         lambda_count * count_loss, lambda_size * size_loss, lambda_round * round_loss,
+         valid_loss, metrics['actual_markers'], metrics['true_positive'],
+         metrics['false_negative'], metrics['false_positive'], metrics['misclassified']]
+    ]
+
+    # Append new data
+    df_log = pd.concat([df_log, pd.DataFrame(new_rows, columns=columns)], ignore_index=True)
+
+    # Save updated DataFrame to CSV
+    df_log.to_csv(log_filename, index=False)
+
     train_loss_list.append(train_loss)
     valid_loss_list.append(valid_loss)
-    
-    print(f"Epoch {epoch+1}/{training_epochs}, Train Loss: {train_loss:.4f}, Valid Loss: {valid_loss:.4f}")
-    print(f"Actual markers: {metrics['actual_markers']}, True positive gold markers: {metrics['true_positive']}, "
-          f"False negative gold markers: {metrics['false_negative']}, False positive gold markers: {metrics['false_positive']}, "
-          f"Misclassified calcification as gold markers: {metrics['misclassified']}")
     
     # Plot and save the loss graph (updates each epoch)
     plt.figure()
@@ -403,14 +505,15 @@ for epoch in range(training_epochs):
     plt.plot(range(1, epoch+2), valid_loss_list, label="Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title(f"Loss Curve for {model_name}")
+    plt.ylim(0, 1)
+    plt.title(f"Loss Curve for {model_instance}")
     plt.legend()
-    plt.savefig(f"{model_name}-{timestamp}-loss.png")
+    plt.savefig(f"{model_instance}-loss.png")
     plt.close()
     
     if valid_loss < best_valid_loss - 0.01:
         best_valid_loss = valid_loss
-        torch.save(model.state_dict(), f"{model_name}-{timestamp}-{fold_id}-best.pth")
+        torch.save(model.state_dict(), f"{model_instance}-best.pth")
         epochs_no_improve = 0
     else:
         epochs_no_improve += 1
@@ -422,4 +525,5 @@ for epoch in range(training_epochs):
 end_time = time.time()
 duration_mins = (end_time - start_time) / 60
 print(f"Finished training after {round(duration_mins, 2)} mins")
-torch.save(model.state_dict(), f"{model_name}-{timestamp}-{fold_id}-final.pth")
+torch.save(model.state_dict(), f"{model_instance}-final.pth")
+
