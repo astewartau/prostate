@@ -64,32 +64,22 @@ print(f"{len(session_dirs)} sessions found.")
 session_dirs = sorted(set([s for s in session_dirs if 'sub-z0449294' not in s]))
 print(f"{len(session_dirs)} sessions found.")
 
-extra_files = sum((glob.glob(os.path.join(session_dir, "extra_data", "*.nii*"))
-                   for session_dir in session_dirs), [])
+extra_files = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*.nii*")) for session_dir in session_dirs), []))
 
-qsm_files2 = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*real.nii*"))
-                         for session_dir in session_dirs), []))
-qsm_files = [x for x in sorted(glob.glob(os.path.join("out/qsm/*.nii")))
-             if 'sub-z0449294' not in x]
-t2s_files = [x for x in sorted(glob.glob(os.path.join("out/t2s/*.nii")))
-             if 'sub-z0449294' not in x]
-r2s_files = [x for x in sorted(glob.glob(os.path.join("out/r2s/*.nii")))
-             if 'sub-z0449294' not in x]
-swi_files = [x for x in sorted(glob.glob(os.path.join("out/swi/*swi.nii")))
-             if 'sub-z0449294' not in x]
-mag_files = [x for x in sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "magnitude_combined.nii"))
-                                   for session_dir in session_dirs), []))
-             if 'sub-z0449294' not in x]
-fmap_files = sorted([ef for ef in extra_files if 'B0.nii' in ef])
+qsm_files2 = sorted(sum((glob.glob(os.path.join(session_dir, "extra_data", "*real.nii*")) for session_dir in session_dirs), []))
+qsm_files = [x for x in sorted(glob.glob(os.path.join("out/qsm/*.nii"))) if 'sub-z0449294' not in x]
+t2s_files = [x for x in sorted(glob.glob(os.path.join("out/t2s/*.nii"))) if 'sub-z0449294' not in x]
+r2s_files = [x for x in sorted(glob.glob(os.path.join("out/r2s/*.nii"))) if 'sub-z0449294' not in x]
+swi_files = [x for x in sorted(glob.glob(os.path.join("out/swi/*swi.nii"))) if 'sub-z0449294' not in x]
+mag_files = [extra_file for extra_file in extra_files if os.path.split(extra_file)[1] == 'magnitude_combined.nii']
+fmap_files = [extra_file for extra_file in extra_files if os.path.split(extra_file)[1] == 'B0.nii']
 
-gre_seg_files = sorted([ef for ef in extra_files if all(p in ef for p in ['segmentation_clean.', 'tgv'])])
-t1_files = sorted([ef for ef in extra_files if 'T1w_resliced' in ef and 'homogeneity-corrected' in ef])
+gre_seg_files = sorted([extra_file for extra_file in extra_files if all(pattern in extra_file for pattern in ['segmentation_clean', 'T1w_resliced'])])
+t1_files = sorted([extra_file for extra_file in extra_files if 'T1w_resliced' in extra_file and 'homogeneity-corrected' in extra_file and 'segmentation' not in extra_file])
 
 ct_files = sorted([ef for ef in extra_files if 'resliced.nii' in ef and 'T1w' not in ef and 'segmentation' not in ef])
-ct_seg_files = sorted([ct.replace(".nii", "_segmentation.nii")
-                        for ct in ct_files if os.path.exists(ct.replace(".nii", "_segmentation.nii"))])
-ct_seg_clean_files = sorted([ct.replace(".nii", "_clean.nii")
-                              for ct in ct_seg_files if os.path.exists(ct.replace(".nii", "_clean.nii"))])
+ct_seg_files = sorted([ct_file.replace(".nii", "_segmentation.nii") for ct_file in ct_files if os.path.exists(ct_file.replace(".nii", "_segmentation.nii"))])
+ct_seg_clean_files = sorted([ct_file.replace(".nii", "_clean.nii") for ct_file in ct_seg_files if os.path.exists(ct_file.replace(".nii", "_clean.nii"))])
 
 print(f"{len(fmap_files)} field maps found.")
 print(f"{len(ct_files)} CT images found.")
@@ -314,52 +304,47 @@ def dice_loss(pred, target, eps=1e-5):
 def combined_loss(pred, target):
     return ce_loss_fn(pred, target) + dice_loss(pred, target)
 
-# --- Prior loss function: count-aware, size, and sphericity-based roundness ---
-def compute_prior_losses(outputs):
-    # Use argmax to obtain the final segmentation (assumes class 1 is the marker)
-    segmentation = torch.argmax(outputs, dim=1).detach().cpu().numpy()
-    B = segmentation.shape[0]
-    batch_count_loss = 0
-    batch_size_loss = 0
-    batch_round_loss = 0
+# --- Differentiable Prior Losses using soft predictions ---
+def compute_prior_losses_soft(outputs, target_volume=30.0):
+    """
+    Computes differentiable approximations for the count, size, and roundness penalties.
+    
+    outputs: (B, C, D, H, W) logits from the network.
+    Assumes class 1 is the marker.
+    
+    Returns (count_loss, size_loss, round_loss) averaged over the batch.
+    """
+    p = F.softmax(outputs, dim=1)  # shape: (B, C, D, H, W)
+    marker_prob = p[:, 1, :, :, :]  # soft probability for class 1; shape: (B, D, H, W)
+    B = marker_prob.shape[0]
+    total_count_loss = 0.0
+    total_size_loss = 0.0
+    total_round_loss = 0.0
+    eps = 1e-6
     for i in range(B):
-        # Binary mask where class 1 is marked as foreground
-        binary_mask = (segmentation[i] == 1).astype(np.uint8)
-        labeled, num_components = scipy.ndimage.label(binary_mask)
-        count_loss = (num_components - 3)**2
-        size_loss = 0
-        round_loss = 0
-        for comp in range(1, num_components + 1):
-            comp_mask = (labeled == comp).astype(np.uint8)
-            vol = comp_mask.sum()
-            # Size penalty: zero if within [15,80]
-            if vol < 15:
-                size_penalty = (15 - vol)**2
-            elif vol > 80:
-                size_penalty = (vol - 80)**2
-            else:
-                size_penalty = 0
-            size_loss += size_penalty
-            # Compute surface area using marching cubes if possible
-            try:
-                verts, faces, normals, values = marching_cubes(comp_mask.astype(np.float32), level=0.5)
-                area = mesh_surface_area(verts, faces)
-                sphericity = (np.pi**(1/3) * (6 * vol)**(2/3)) / area
-                round_penalty = (1 - sphericity)**2
-            except Exception as e:
-                print(f"Marching cubes failed for component {comp} with error: {e}")
-                round_penalty = 1.0
-            round_loss += round_penalty
-        if num_components > 0:
-            size_loss /= num_components
-            round_loss /= num_components
-        batch_count_loss += count_loss
-        batch_size_loss += size_loss
-        batch_round_loss += round_loss
-    batch_count_loss /= B
-    batch_size_loss /= B
-    batch_round_loss /= B
-    return batch_count_loss, batch_size_loss, batch_round_loss
+        # Differentiable volume as sum of soft probabilities
+        vol = marker_prob[i].sum()
+        # Count loss: assume expected volume per marker is target_volume and desired count is 3
+        pred_count = vol / target_volume
+        count_loss = (pred_count - 3)**2
+
+        # Size loss: penalize if volume is too low (<15) or too high (>80) using ReLU
+        size_loss = F.relu(15 - vol)**2 + F.relu(vol - 80)**2
+
+        # Roundness loss: approximate surface area by summing finite differences
+        # Compute gradients along each dimension
+        dx = torch.abs(marker_prob[i][1:, :, :] - marker_prob[i][:-1, :, :])
+        dy = torch.abs(marker_prob[i][:, 1:, :] - marker_prob[i][:, :-1, :])
+        dz = torch.abs(marker_prob[i][:, :, 1:] - marker_prob[i][:, :, :-1])
+        surface_area = dx.sum() + dy.sum() + dz.sum()
+        sphericity = (np.pi**(1/3) * (6 * vol)**(2/3)) / (surface_area + eps)
+        round_loss = (1 - sphericity)**2
+
+        total_count_loss += count_loss
+        total_size_loss += size_loss
+        total_round_loss += round_loss
+
+    return total_count_loss / B, total_size_loss / B, total_round_loss / B
 
 # --- Metric helper functions using connected components ---
 def process_volume(pred_vol, targ_vol, calc_vol, structure):
@@ -414,7 +399,7 @@ def compute_metrics(pred, targ):
 
 # Hyperparameters for prior losses
 lambda_count = 0.001
-lambda_size = 0.001
+lambda_size = 5e-07
 lambda_round = 0.001
 
 # --- Prepare lists for loss plotting ---
@@ -427,79 +412,151 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_epoch
 
 best_valid_loss = float('inf')
 epochs_no_improve = 0
-patience = 300
+patience = 400
 
 # Define column names
-log_filename = f"{model_instance}-training.csv"
+# Define column names for training and validation logs
 columns = [
-    "Epoch", "Set", "CE", "Dice", "λ₁ ⋅ CountLoss", "λ₂ ⋅ SizeLoss", "λ₃ ⋅ RoundLoss",
+    "Epoch", "CE", "Dice", "λ₁ ⋅ CountLoss", "λ₂ ⋅ SizeLoss", "λ₃ ⋅ RoundLoss",
     "Total Loss", "Markers Found", "TPs", "FNs", "FPs", "Misclassified Calcs"
 ]
-df_log = pd.DataFrame(columns=columns)
+
+train_log_filename = f"{model_instance}-train.csv"
+valid_log_filename = f"{model_instance}-valid.csv"
+
+df_train_log = pd.DataFrame(columns=columns)
+df_valid_log = pd.DataFrame(columns=columns)
 
 print("Starting training loop...")
 start_time = time.time()
+
 for epoch in range(training_epochs):
     model.train()
     train_loss = 0
+    train_count_loss = 0
+    train_size_loss = 0
+    train_round_loss = 0
+
+    train_preds = []
+    train_targs = []
+
     for images, masks in train_loader:
         images, masks = images.to(device), masks.to(device)
         optimizer.zero_grad()
         outputs = model(images)
+
         base_loss = combined_loss(outputs, masks)
-        count_loss, size_loss, round_loss = compute_prior_losses(outputs)
+        count_loss, size_loss, round_loss = compute_prior_losses_soft(outputs)
+
+        # Training losses
         prior_loss = lambda_count * count_loss + lambda_size * size_loss + lambda_round * round_loss
         total_loss = base_loss + torch.tensor(prior_loss, device=device, dtype=torch.float32)
         total_loss.backward()
         optimizer.step()
+
         train_loss += total_loss.item() * images.size(0)
+        train_count_loss += count_loss * images.size(0)
+        train_size_loss += size_loss * images.size(0)
+        train_round_loss += round_loss * images.size(0)
+
+        preds = torch.argmax(outputs, dim=1)
+        train_preds.append(preds.cpu().numpy())
+        train_targs.append(masks.cpu().numpy())
+
     train_loss /= len(train_loader.dataset)
-    
+    train_count_loss /= len(train_loader.dataset)
+    train_size_loss /= len(train_loader.dataset)
+    train_round_loss /= len(train_loader.dataset)
+
+    # Compute separate training metrics
+    train_preds = np.concatenate(train_preds, axis=0)
+    train_targs = np.concatenate(train_targs, axis=0)
+    train_metrics = compute_metrics(train_preds, train_targs)
+
+    # --- Validation Phase ---
     model.eval()
     valid_loss = 0
-    all_preds = []
-    all_targs = []
+    valid_count_loss = 0
+    valid_size_loss = 0
+    valid_round_loss = 0
+
+    valid_preds = []
+    valid_targs = []
+
     with torch.no_grad():
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
+
             base_loss = combined_loss(outputs, masks)
-            count_loss, size_loss, round_loss = compute_prior_losses(outputs)
+            count_loss, size_loss, round_loss = compute_prior_losses_soft(outputs)
+
+            # Validation losses
             prior_loss = lambda_count * count_loss + lambda_size * size_loss + lambda_round * round_loss
             total_loss = base_loss + torch.tensor(prior_loss, device=device, dtype=torch.float32)
+
             valid_loss += total_loss.item() * images.size(0)
+            valid_count_loss += count_loss * images.size(0)
+            valid_size_loss += size_loss * images.size(0)
+            valid_round_loss += round_loss * images.size(0)
+
             preds = torch.argmax(outputs, dim=1)
-            all_preds.append(preds.cpu().numpy())
-            all_targs.append(masks.cpu().numpy())
+            valid_preds.append(preds.cpu().numpy())
+            valid_targs.append(masks.cpu().numpy())
+
     valid_loss /= len(valid_loader.dataset)
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_targs = np.concatenate(all_targs, axis=0)
-    
-    metrics = compute_metrics(all_preds, all_targs)
+    valid_count_loss /= len(valid_loader.dataset)
+    valid_size_loss /= len(valid_loader.dataset)
+    valid_round_loss /= len(valid_loader.dataset)
 
-    # Format results for DataFrame
-    new_rows = [
-        [epoch+1, "Train", ce_loss_fn(outputs, masks).item(), dice_loss(outputs, masks).item(),
-         lambda_count * count_loss, lambda_size * size_loss, lambda_round * round_loss,
-         train_loss, metrics['actual_markers'], metrics['true_positive'],
-         metrics['false_negative'], metrics['false_positive'], metrics['misclassified']],
-        
-        [epoch+1, "Validation", ce_loss_fn(outputs, masks).item(), dice_loss(outputs, masks).item(),
-         lambda_count * count_loss, lambda_size * size_loss, lambda_round * round_loss,
-         valid_loss, metrics['actual_markers'], metrics['true_positive'],
-         metrics['false_negative'], metrics['false_positive'], metrics['misclassified']]
-    ]
+    # Compute separate validation metrics
+    valid_preds = np.concatenate(valid_preds, axis=0)
+    valid_targs = np.concatenate(valid_targs, axis=0)
+    valid_metrics = compute_metrics(valid_preds, valid_targs)
 
-    # Append new data
-    df_log = pd.concat([df_log, pd.DataFrame(new_rows, columns=columns)], ignore_index=True)
+    # --- Format results for DataFrame (round to 4 decimals) ---
+    new_train_row = {
+        "Epoch": epoch + 1,
+        "CE": round(ce_loss_fn(outputs, masks).item(), 4),
+        "Dice": round(dice_loss(outputs, masks).item(), 4),
+        "λ₁ ⋅ CountLoss": round((lambda_count * train_count_loss).item(), 4),
+        "λ₂ ⋅ SizeLoss": round((lambda_size * train_size_loss).item(), 4),
+        "λ₃ ⋅ RoundLoss": round((lambda_round * train_round_loss).item(), 4),
+        "Total Loss": round(train_loss, 4),
+        "Markers Found": train_metrics['actual_markers'],
+        "TPs": train_metrics['true_positive'],
+        "FNs": train_metrics['false_negative'],
+        "FPs": train_metrics['false_positive'],
+        "Misclassified Calcs": train_metrics['misclassified']
+    }
 
-    # Save updated DataFrame to CSV
-    df_log.to_csv(log_filename, index=False)
+    new_valid_row = {
+        "Epoch": epoch + 1,
+        "CE": round(ce_loss_fn(outputs, masks).item(), 4),
+        "Dice": round(dice_loss(outputs, masks).item(), 4),
+        "λ₁ ⋅ CountLoss": round((lambda_count * valid_count_loss).item(), 4),
+        "λ₂ ⋅ SizeLoss": round((lambda_size * valid_size_loss).item(), 4),
+        "λ₃ ⋅ RoundLoss": round((lambda_round * valid_round_loss).item(), 4),
+        "Total Loss": round(valid_loss, 4),
+        "Markers Found": valid_metrics['actual_markers'],
+        "TPs": valid_metrics['true_positive'],
+        "FNs": valid_metrics['false_negative'],
+        "FPs": valid_metrics['false_positive'],
+        "Misclassified Calcs": valid_metrics['misclassified']
+    }
+
+    # Append data to separate DataFrames
+    df_train_log = pd.concat([df_train_log, pd.DataFrame([new_train_row])], ignore_index=True)
+    df_valid_log = pd.concat([df_valid_log, pd.DataFrame([new_valid_row])], ignore_index=True)
+
+    # Save separate CSVs
+    df_train_log.round(4).to_csv(train_log_filename, index=False)
+    df_valid_log.round(4).to_csv(valid_log_filename, index=False)
 
     train_loss_list.append(train_loss)
     valid_loss_list.append(valid_loss)
-    
-    # Plot and save the loss graph (updates each epoch)
+
+    # --- Plot and save the loss graph ---
     plt.figure()
     plt.plot(range(1, epoch+2), train_loss_list, label="Train Loss")
     plt.plot(range(1, epoch+2), valid_loss_list, label="Validation Loss")
@@ -510,7 +567,8 @@ for epoch in range(training_epochs):
     plt.legend()
     plt.savefig(f"{model_instance}-loss.png")
     plt.close()
-    
+
+    # --- Early Stopping ---
     if valid_loss < best_valid_loss - 0.01:
         best_valid_loss = valid_loss
         torch.save(model.state_dict(), f"{model_instance}-best.pth")
@@ -520,6 +578,7 @@ for epoch in range(training_epochs):
     if epochs_no_improve >= patience:
         print("Early stopping triggered")
         break
+
     scheduler.step()
 
 end_time = time.time()
