@@ -39,7 +39,7 @@ echo "Testing Python"
 python -c "import sys; print(sys.executable, sys.version, flush=True)"
 
 # Print a message to confirm the environment variables
-echo "Starting train_one_model_new.py with MODEL_NAME=${MODEL_NAME} and FOLD_ID=${FOLD_ID}"
+echo "Starting train_one_model.py with MODEL_NAME=${MODEL_NAME} and FOLD_ID=${FOLD_ID}"
 
 # Run the training script with command-line arguments
-python train_one_model_new_penalties.py "$MODEL_NAME" "$FOLD_ID"
+python train_one_model.py "$MODEL_NAME" "$FOLD_ID"

@@ -1,28 +1,24 @@
 #!/usr/bin/env python
 import argparse
-import glob
 import os
-import json
-import time
-import datetime
-import sys
-
-import nibabel as nib
+import glob
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchio as tio
+import nibabel as nib
+from sklearn.model_selection import KFold
 import scipy.ndimage
 import matplotlib.pyplot as plt
-import pandas as pd
-
-from sklearn.model_selection import KFold
-from skimage.measure import marching_cubes, mesh_surface_area
+import datetime
+import time
+import sys
 
 # ---------------------------
-# Define a simple 3D UNet.
-# This must match your training architecture.
+# UNet3D model definition
+# ---------------------------
 class UNet3D(nn.Module):
     def __init__(self, in_channels, out_channels, channels=(16, 32, 64, 128, 256)):
         super(UNet3D, self).__init__()
@@ -42,6 +38,7 @@ class UNet3D(nn.Module):
             self.decoders.append(self.conv_block(ch * 2, ch))
             cur_channels = ch
         self.final_conv = nn.Conv3d(cur_channels, out_channels, kernel_size=1)
+
     def conv_block(self, in_channels, out_channels):
         return nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
@@ -51,6 +48,7 @@ class UNet3D(nn.Module):
             nn.BatchNorm3d(out_channels),
             nn.ReLU(inplace=True)
         )
+
     def forward(self, x):
         enc_feats = []
         for encoder in self.encoders:
@@ -72,136 +70,76 @@ class UNet3D(nn.Module):
         return self.final_conv(x)
 
 # ---------------------------
-# restore_shape() reverses the CropOrPad operation.
-def restore_shape(seg, original_shape):
-    current_shape = seg.shape
-    seg = seg.clone()
-    for i in range(3):
-        diff = original_shape[i] - current_shape[i]
-        if diff > 0:
-            pad_before = diff // 2
-            pad_after = diff - pad_before
-            if i == 0:
-                seg = F.pad(seg.unsqueeze(0), (0,0,0,0,pad_before, pad_after)).squeeze(0)
-            elif i == 1:
-                seg = F.pad(seg.unsqueeze(0), (0,0,pad_before, pad_after,0,0)).squeeze(0)
-            elif i == 2:
-                seg = F.pad(seg.unsqueeze(0), (pad_before, pad_after,0,0,0,0)).squeeze(0)
-        elif diff < 0:
-            crop_before = (-diff) // 2
-            crop_after = crop_before + original_shape[i]
-            if i == 0:
-                seg = seg[crop_before:crop_after, :, :]
-            elif i == 1:
-                seg = seg[:, crop_before:crop_after, :]
-            elif i == 2:
-                seg = seg[:, :, crop_before:crop_after]
-    return seg
+# Custom transform: Merge Input Channels
+# ---------------------------
+class MergeInputChannels(tio.Transform):
+    def __init__(self, infile_cols):
+        super().__init__()
+        self.infile_cols = infile_cols
+
+    def apply_transform(self, subject):
+        input_tensors = []
+        for col in self.infile_cols:
+            if col not in subject:
+                continue
+            tensor = subject[col].data
+            if tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            input_tensors.append(tensor)
+        if not input_tensors:
+            return subject
+        merged = torch.cat(input_tensors, dim=0)
+        subject['image'] = tio.ScalarImage(tensor=merged, affine=subject[self.infile_cols[0]].affine)
+        if 'seg' in subject:
+            subject['mask'] = subject['seg']
+        return subject
 
 # ---------------------------
-# Utility: parse model type and fold from model filename.
-def parse_model_info(model_path):
-    basename = os.path.basename(model_path)
-    parts = basename.split('-')
-    try:
-        model_type = parts[0]
-        fold = int(parts[3])
-        return model_type, fold
-    except Exception as e:
-        raise ValueError("Could not parse model type and fold number from filename.") from e
+# Build dataframe from bids directories
+# ---------------------------
+def build_dataframe(bids_dirs):
+    paths_list = []
+    for bids_dir in bids_dirs:
+        subject_dirs = sorted(glob.glob(os.path.join(bids_dir, "sub-*")))
+        subject_dirs = [s for s in subject_dirs if 'sub-z0449294' not in s]
+        for subject_dir in subject_dirs:
+            paths_dict = {}
+            nii_paths = glob.glob(os.path.join(subject_dir, "ses-*", "*", "*.nii"))
+            for nii_path in nii_paths:
+                modality_name = os.path.basename(nii_path).split('.')[0]
+                if modality_name.startswith('sub-'):
+                    continue
+                paths_dict[modality_name] = nii_path
+            paths_list.append(paths_dict)
+    df = pd.DataFrame(paths_list)
+    df = df.where(pd.notnull(df), None)
+    return df
 
 # ---------------------------
-# Utility: build model_data dictionary for validation selection.
-# For demonstration, this is implemented for T1. Extend as needed.
-def get_model_data(model_type):
-    bids_dir = "bids"
-    session_dirs = []
-    for json_path in sorted(glob.glob(os.path.join(bids_dir, "sub*", "ses*", "anat", "*echo-01*mag*json"))):
-        with open(json_path, 'r') as jf:
-            json_data = json.load(jf)
-            if json_data['ProtocolName'] in ["wip_iSWI_fl3d_vibe_TRY THIS ONE"]:
-                session_dirs.append(os.sep.join(os.path.split(json_path)[0].split(os.sep)[:-1]))
-    session_dirs = sorted(set([s for s in session_dirs if 'sub-z0449294' not in s]))
-    extra_files = sum((glob.glob(os.path.join(session_dir, "extra_data", "*.nii*"))
-                       for session_dir in session_dirs), [])
-    if model_type == "T1":
-        files = sorted([ef for ef in extra_files if 'T1w_resliced' in ef and 'homogeneity-corrected' in ef])
-        seg_files = sorted([ef for ef in extra_files if all(p in ef for p in ['segmentation_clean.', 'tgv'])])
-        return pd.DataFrame({"t1_files": files, "seg_files": seg_files})
-    else:
-        raise ValueError("Validation input selection for model type {} not implemented.".format(model_type))
+# Parse model filename to extract model name and fold ID.
+# Expected format: ModelName-YYYYMMDD-HHMMSS-foldID-(best|final).pth
+# ---------------------------
+def parse_model_filename(model_filepath):
+    base = os.path.basename(model_filepath)
+    parts = base.split('-')
+    if len(parts) < 5:
+        raise ValueError("Unexpected model filename format.")
+    model_name = parts[0]
+    fold_id = int(parts[-2])
+    return model_name, fold_id
 
 # ---------------------------
-# Utility: get validation input file for a given fold.
-def get_validation_input_from_fold(model_type, fold, random_state=42):
-    df = get_model_data(model_type)
-    qsm_files = [x for x in sorted(glob.glob(os.path.join("out/qsm/*.nii")))
-                 if 'sub-z0449294' not in x]
-    n_splits = len(qsm_files)
-    kf = KFold(n_splits=n_splits, random_state=random_state, shuffle=True)
-    splits = list(kf.split(df))
-    if fold >= len(splits):
-        raise ValueError(f"Fold {fold} out of range for n_splits={n_splits}.")
-    _, valid_index = splits[fold]
-    val_idx = valid_index[0]
-    input_file = df.iloc[val_idx]['t1_files']
-    return input_file
+# Helper: Match shapes of two arrays by cropping to the smallest dimensions.
+# ---------------------------
+def match_shapes(a, b):
+    new_shape = tuple(min(a_dim, b_dim) for a_dim, b_dim in zip(a.shape, b.shape))
+    a_cropped = a[tuple(slice(0, s) for s in new_shape)]
+    b_cropped = b[tuple(slice(0, s) for s in new_shape)]
+    return a_cropped, b_cropped
 
 # ---------------------------
-# Loss and metric helper functions (adapted from training)
-ce_loss_fn = nn.CrossEntropyLoss()
-def dice_loss(pred, target, eps=1e-5):
-    pred_soft = F.softmax(pred, dim=1)
-    target_onehot = F.one_hot(target, num_classes=pred.shape[1]).permute(0, 4, 1, 2, 3).float()
-    intersection = (pred_soft * target_onehot).sum(dim=(2,3,4))
-    sums = pred_soft.sum(dim=(2,3,4)) + target_onehot.sum(dim=(2,3,4))
-    dice = (2 * intersection + eps) / (sums + eps)
-    return 1 - dice.mean()
-def combined_loss(pred, target):
-    return ce_loss_fn(pred, target) + dice_loss(pred, target)
-
-def compute_prior_losses(outputs):
-    # Compute prior losses using predicted segmentation (assumes class 1 is marker)
-    segmentation = torch.argmax(outputs, dim=1).detach().cpu().numpy()
-    B = segmentation.shape[0]
-    batch_count_loss = 0
-    batch_size_loss = 0
-    batch_round_loss = 0
-    for i in range(B):
-        binary_mask = (segmentation[i] == 1).astype(np.uint8)
-        labeled, num_components = scipy.ndimage.label(binary_mask)
-        count_loss = (num_components - 3)**2
-        size_loss = 0
-        round_loss = 0
-        for comp in range(1, num_components + 1):
-            comp_mask = (labeled == comp).astype(np.uint8)
-            vol = comp_mask.sum()
-            if vol < 15:
-                size_penalty = (15 - vol)**2
-            elif vol > 80:
-                size_penalty = (vol - 80)**2
-            else:
-                size_penalty = 0
-            size_loss += size_penalty
-            try:
-                verts, faces, normals, values = marching_cubes(comp_mask.astype(np.float32), level=0.5)
-                area = mesh_surface_area(verts, faces)
-                sphericity = (np.pi**(1/3) * (6 * vol)**(2/3)) / area
-                round_penalty = (1 - sphericity)**2
-            except Exception as e:
-                round_penalty = 1.0
-            round_loss += round_penalty
-        if num_components > 0:
-            size_loss /= num_components
-            round_loss /= num_components
-        batch_count_loss += count_loss
-        batch_size_loss += size_loss
-        batch_round_loss += round_loss
-    batch_count_loss /= B
-    batch_size_loss /= B
-    batch_round_loss /= B
-    return batch_count_loss, batch_size_loss, batch_round_loss
-
+# Metric functions (using connected components in 3D)
+# ---------------------------
 def process_volume(pred_vol, targ_vol, calc_vol, structure):
     pred_labels, pred_nlabels = scipy.ndimage.label(pred_vol, structure=structure)
     _, targ_nlabels = scipy.ndimage.label(targ_vol, structure=structure)
@@ -221,163 +159,287 @@ def process_volume(pred_vol, targ_vol, calc_vol, structure):
     return pred_nlabels, targ_nlabels, n_overlaps, misclassified
 
 def compute_metrics(pred, targ):
+    if pred.shape != targ.shape:
+        print("Warning: predicted segmentation and ground truth shapes do not match. Cropping to minimum shape.")
+        pred, targ = match_shapes(pred, targ)
     structure = np.ones((3, 3, 3), dtype=bool)
-    total_pred_marker_count = 0
-    total_targ_marker_count = 0
-    total_overlap_count = 0
-    total_misclassified = 0
-    # Binary masks: assume class==1 are markers and class==2 are calcifications
     pred_marker = (pred == 1).astype(np.int32)
     targ_marker = (targ == 1).astype(np.int32)
     targ_calc = (targ == 2).astype(np.int32)
     pred_marker = scipy.ndimage.binary_dilation(pred_marker)
     targ_marker = scipy.ndimage.binary_dilation(targ_marker)
     targ_calc = scipy.ndimage.binary_dilation(targ_calc)
-    # Process slice by slice
-    for i in range(pred_marker.shape[0]):
-        p_vol = pred_marker[i]
-        t_vol = targ_marker[i]
-        c_vol = targ_calc[i]
-        p_n, t_n, n_overlap, misclassified = process_volume(p_vol, t_vol, c_vol, structure)
-        total_pred_marker_count += p_n
-        total_targ_marker_count += t_n
-        total_overlap_count += n_overlap
-        total_misclassified += misclassified
-    false_negative = total_targ_marker_count - total_overlap_count
-    false_positive = total_pred_marker_count - total_overlap_count
+    p_n, t_n, n_overlap, misclassified = process_volume(pred_marker, targ_marker, targ_calc, structure)
+    false_negative = t_n - n_overlap
+    false_positive = p_n - n_overlap
     return {
-         "actual_markers": total_targ_marker_count,
-         "true_positive": total_overlap_count,
+         "actual_markers": t_n,
+         "true_positive": n_overlap,
          "false_negative": false_negative,
          "false_positive": false_positive,
-         "misclassified": total_misclassified
+         "misclassified": misclassified
     }
 
-# Hyperparameters for prior losses
-lambda_count = 0.001
-lambda_size = 0.001
-lambda_round = 0.001
-
+# ---------------------------
+# Main function: inference or full evaluation
 # ---------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Run segmentation on a NIfTI file using a pretrained model.")
-    parser.add_argument('--input', type=str, help="Path to the input NIfTI file (if omitted, automatically selects validation input)")
-    parser.add_argument('--model', type=str, required=True, help="Path to the model .pth file")
-    parser.add_argument('--output', type=str, required=True, help="Path to the output NIfTI segmentation file")
+    parser = argparse.ArgumentParser(
+        description="Run inference on a validation example using one or more trained models."
+    )
+    parser.add_argument("--model", type=str, nargs="+", required=True,
+                        help="Path(s) to one or more model .pth file(s)")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Evaluate the given single model on the entire dataset (no NIfTI saving)")
     args = parser.parse_args()
 
-    model_type, fold_from_filename = parse_model_info(args.model)
+    model_paths = args.model
+    evaluate_mode = args.evaluate
 
-    if not args.input:
-        args.input = get_validation_input_from_fold(model_type, fold_from_filename)
+    random_state = 42
+    bids_dirs = ['bids-2024', 'bids-2025']
+    infile_cols = ['qsm_siemens']
+    #infile_cols = ['qsm_siemens']
+    segmentation_col = 'qsm_siemens_segmentation_clean'
+    #segmentation_col = 'qsm_siemens_segmentation_clean'
+    crop_dimensions = (100, 100, 64)
+    #crop_dimensions = (80,80,80)
 
-    nii = nib.load(args.input)
-    input_data = nii.get_fdata()
-    original_shape = input_data.shape  # (D, H, W)
-    affine = nii.affine
+    df = build_dataframe(bids_dirs)
+    for col in infile_cols + [segmentation_col]:
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found in dataframe.")
+        df = df[df[col].notna()].reset_index(drop=True)
 
-    # Save the original input for reference.
-    input_outfile = args.output.replace('.nii', '_input.nii')
-    nib.save(nib.Nifti1Image(input_data.astype(np.float32), affine), input_outfile)
+    print(f"Number of subjects in dataframe: {len(df)}")
+    if len(df) == 0:
+        raise ValueError("No subjects found in the dataframe after filtering.")
 
-    # Create a TorchIO ScalarImage (shape: (1, D, H, W))
-    subject = tio.Subject(
-        image=tio.ScalarImage(tensor=torch.tensor(input_data, dtype=torch.float32).unsqueeze(0), affine=affine)
-    )
-    # Pre-process: ZNormalization and CropOrPad to (80,80,80)
-    transform = tio.Compose([
-        tio.ZNormalization(),
-        tio.CropOrPad((80,80,80))
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    in_channels = len(infile_cols)
+    num_classes = 3
+
+    # Build transform common to both modes.
+    inference_transforms = tio.Compose([
+         tio.CropOrPad(crop_dimensions),
+         tio.ZNormalization(),
+         MergeInputChannels(infile_cols)
     ])
-    subject_transformed = transform(subject)
-    input_tensor = subject_transformed['image'].data  # shape (1,80,80,80)
 
-    # Prepare model (assumed architecture must match training)
-    model = UNet3D(in_channels=1, out_channels=3)
-    model.to('cpu')
-    model.load_state_dict(torch.load(args.model, map_location='cpu'))
+    # Load model only once.
+    model_filepath = model_paths[0]
+    model_name, fold_id = parse_model_filename(model_filepath)
+    print(f"Processing model: {model_filepath}")
+    print(f"Model: {model_name}, Fold ID: {fold_id}")
+
+    model = UNet3D(in_channels=in_channels, out_channels=num_classes)
+    model = model.to(device)
+    state_dict = torch.load(model_filepath, map_location=device)
+    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+        model.load_state_dict(state_dict["model_state_dict"])
+    else:
+        model.load_state_dict(state_dict)
     model.eval()
 
-    with torch.no_grad():
-        input_tensor = input_tensor.unsqueeze(0)  # shape: (1,1,80,80,80)
-        outputs = model(input_tensor)             # shape: (1,3,80,80,80)
-        preds = torch.argmax(outputs, dim=1)        # shape: (1,80,80,80)
-    preds = preds.squeeze(0)  # shape: (80,80,80)
+    summary_list = []
 
-    # Restore segmentation to original shape (using symmetric padding/cropping)
-    seg_restored = restore_shape(preds, original_shape)
+    # If evaluation flag is provided with a single model, evaluate on all available data.
+    if evaluate_mode and len(model_paths) == 1:
+        model_filepath = model_paths[0]
+        model_name, _ = parse_model_filename(model_filepath)
+        print(f"Evaluating model '{model_name}' on the entire dataset.")
+        in_channels = len(infile_cols)
+        num_classes = 3
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        model = UNet3D(in_channels=in_channels, out_channels=num_classes).to(device)
+        state_dict = torch.load(model_filepath, map_location=device)
+        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+            model.load_state_dict(state_dict["model_state_dict"])
+        else:
+            model.load_state_dict(state_dict)
+        model.eval()
 
-    # Save the segmentation (as int16) with original affine.
-    seg_outfile = args.output
-    out_nii = nib.Nifti1Image(seg_restored.numpy().astype(np.int16), affine)
-    nib.save(out_nii, seg_outfile)
+        summary_list = []
+        for idx in range(len(df)):
+            subject_row = df.iloc[idx]
+            subject_dict = {}
+            for col in infile_cols:
+                if col in subject_row:
+                    subject_dict[col] = tio.ScalarImage(subject_row[col])
+            subject_dict['seg'] = tio.LabelMap(subject_row[segmentation_col])
+            subject = tio.Subject(**subject_dict)
+            subject = inference_transforms(subject)
 
-    # Optionally, also save the raw outputs (probabilities/logits) with a suffix.
-    outputs_outfile = args.output.replace('.nii', '_outputs.nii')
-    out_background = restore_shape(outputs[0,0].squeeze(0), original_shape)
-    out_markers = restore_shape(outputs[0,1].squeeze(0), original_shape)
-    out_calcification = restore_shape(outputs[0,2].squeeze(0), original_shape)
-    out_logits = torch.stack([out_background, out_markers, out_calcification], dim=3)
-    out_nii_logits = nib.Nifti1Image(out_logits.numpy().astype(np.float32), affine)
-    nib.save(out_nii_logits, outputs_outfile)
+            with torch.no_grad():
+                input_tensor = subject['image'].data.unsqueeze(0).to(device)
+                outputs = model(input_tensor)
+                probs = F.softmax(outputs, dim=1)
+                segmentation = torch.argmax(probs, dim=1)
 
-    # ---------------------------
-    # If a matching ground-truth segmentation exists (i.e. input was auto-selected),
-    # load it, apply the same cropping transform (without normalization) and compute losses & metrics.
-    df_model = get_model_data(model_type)
-    row = df_model[df_model['t1_files'] == args.input]
-    if not row.empty:
-        gt_seg_file = row.iloc[0]['seg_files']
-        gt_nii = nib.load(gt_seg_file)
-        gt_seg_data = gt_nii.get_fdata()
-        # Create a TorchIO LabelMap for segmentation; only CropOrPad is applied.
-        subject_seg = tio.Subject(
-            seg=tio.LabelMap(tensor=torch.tensor(gt_seg_data, dtype=torch.int16).unsqueeze(0), affine=gt_nii.affine)
-        )
-        transform_seg = tio.CropOrPad((80,80,80))
-        subject_seg_transformed = transform_seg(subject_seg)
-        gt_seg_tensor = subject_seg_transformed['seg'].data.squeeze(0).long()  # shape (80,80,80)
+            seg_np = segmentation.squeeze(0).cpu().numpy().astype(np.uint8)
+            gt_tensor = subject['mask'].data.squeeze(0).cpu().numpy().astype(np.uint8)
+            metrics = compute_metrics(seg_np, gt_tensor)
 
-        # Compute loss values using the transformed outputs and ground truth.
-        # (Add a batch dimension to gt_seg_tensor to match outputs shape.)
-        ce_loss_value = ce_loss_fn(outputs, gt_seg_tensor.unsqueeze(0)).item()
-        dice_loss_value = dice_loss(outputs, gt_seg_tensor.unsqueeze(0)).item()
-        base_loss_value = ce_loss_value + dice_loss_value
-        count_loss, size_loss, round_loss = compute_prior_losses(outputs)
-        prior_loss_value = lambda_count * count_loss + lambda_size * size_loss + lambda_round * round_loss
-        total_loss_value = base_loss_value + prior_loss_value
+            summary_list.append({
+                "Subject Index": idx,
+                "Input image path": subject_row[infile_cols[0]],
+                "Actual markers": metrics["actual_markers"],
+                "True positives": metrics["true_positive"],
+                "False negatives": metrics["false_negative"],
+                "False positives": metrics["false_positive"],
+                "Misclassified": metrics["misclassified"]
+            })
+            print(f"Processed subject index: {idx}")
 
-        # Compute metrics using the predicted segmentation (on the transformed space).
-        preds_tensor = torch.argmax(outputs, dim=1)  # shape: (1,80,80,80)
-        preds_np = preds_tensor.cpu().numpy()[0]
-        gt_np = gt_seg_tensor.cpu().numpy()
-        metrics = compute_metrics(preds_np[np.newaxis, ...], gt_np[np.newaxis, ...])
+        summary_df = pd.DataFrame(summary_list)
+        print("\nSummary Metrics for evaluation on the entire dataset:")
+        print(summary_df.to_string(index=False))
 
-        # Get subject name from args.input (e.g. filepath is bids/sub-z3268423/ses-20240109/extra_data/T1.nii sub is sub-z3268423)
-        subject_name = [dir_name for dir_name in args.input.split(os.sep) if dir_name.startswith('sub-')][0]
+        total_actual = summary_df["Actual markers"].sum()
+        total_true_positive = summary_df["True positives"].sum()
+        total_false_negative = summary_df["False negatives"].sum()
+        total_false_positive = summary_df["False positives"].sum()
+        total_misclassified = summary_df["Misclassified"].sum()
 
-        # Create a dataframe with the results (displaying floats to 4 decimals).
-        data = {
-            "Set": ["Validation"],
-            "Subject": [subject_name],
-            "CE": [f"{ce_loss_value:.4f}"],
-            "Dice": [f"{dice_loss_value:.4f}"],
-            "λ₁ ⋅ CountLoss": [f"{lambda_count * count_loss:.4f}"],
-            "λ₂ ⋅ SizeLoss": [f"{lambda_size * size_loss:.4f}"],
-            "λ₃ ⋅ RoundLoss": [f"{lambda_round * round_loss:.4f}"],
-            "Total Loss": [f"{total_loss_value:.4f}"],
-            "Markers Found": [metrics['actual_markers']],
-            "TPs": [metrics['true_positive']],
-            "FNs": [metrics['false_negative']],
-            "FPs": [metrics['false_positive']],
-            "Misclassified Calcs": [metrics['misclassified']]
+        print("\nAggregated Metrics Across All Subjects:")
+        print(f"Total actual markers: {total_actual}")
+        print(f"Total true positive markers: {total_true_positive}")
+        print(f"Total false negative markers: {total_false_negative}")
+        print(f"Total false positive markers: {total_false_positive}")
+        print(f"Total misclassified markers: {total_misclassified}")
+
+        if total_actual > 0:
+            tp_pct = total_true_positive / total_actual * 100
+            fn_pct = total_false_negative / total_actual * 100
+            fp_pct = total_false_positive / total_actual * 100
+            mis_pct = total_misclassified / total_actual * 100
+            print("\nPercentage Metrics (relative to actual markers):")
+            print(f"True positive percentage: {tp_pct:.2f}%")
+            print(f"False negative percentage: {fn_pct:.2f}%")
+            print(f"False positive percentage: {fp_pct:.2f}%")
+            print(f"Misclassified percentage: {mis_pct:.2f}%")
+        return
+
+    # Normal mode: use the fold-split evaluation (one subject per model based on fold ID)
+    kf = KFold(n_splits=len(df), random_state=random_state, shuffle=True)
+    splits = list(kf.split(df))
+    summary_list = []
+
+    for model_filepath in model_paths:
+        model_name, fold_id = parse_model_filename(model_filepath)
+        print(f"\nProcessing model: {model_filepath}")
+        print(f"Model: {model_name}, Fold ID: {fold_id}")
+        if fold_id >= len(splits):
+            raise ValueError(f"Fold ID {fold_id} out of range. There are only {len(splits)} folds.")
+        _, valid_index = splits[fold_id]
+        assert len(valid_index) == 1, f"Expected one validation subject, got {len(valid_index)}."
+        val_subject_idx = valid_index[0]
+        subject_row = df.iloc[val_subject_idx]
+        print(f"Running inference on subject index: {val_subject_idx}")
+
+        # Build the subject dictionary
+        subject_dict = {}
+        for col in infile_cols:
+            if col in subject_row:
+                subject_dict[col] = tio.ScalarImage(subject_row[col])
+        subject_dict['seg'] = tio.LabelMap(subject_row[segmentation_col])
+        subject = tio.Subject(**subject_dict)
+        subject = inference_transforms(subject)
+
+        in_channels = len(infile_cols)
+        num_classes = 3
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        model = UNet3D(in_channels=in_channels, out_channels=num_classes).to(device)
+        state_dict = torch.load(model_filepath, map_location=device)
+        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+            model.load_state_dict(state_dict["model_state_dict"])
+        else:
+            model.load_state_dict(state_dict)
+        model.eval()
+
+        with torch.no_grad():
+            input_tensor = subject['image'].data.unsqueeze(0).to(device)
+            outputs = model(input_tensor)
+            probs = F.softmax(outputs, dim=1)
+            segmentation = torch.argmax(probs, dim=1)
+
+        seg_np = segmentation.squeeze(0).cpu().numpy().astype(np.uint8)
+        gt_tensor = subject['mask'].data.squeeze(0).cpu().numpy().astype(np.uint8)
+        metrics = compute_metrics(seg_np, gt_tensor)
+        for in_file in infile_cols:
+            if in_file in subject_row:
+                print(f"Input image path: {subject_row[in_file]}")
+        print("Inference Metrics:")
+        print(f"  Actual markers: {metrics['actual_markers']}")
+        print(f"  True positive markers: {metrics['true_positive']}")
+        print(f"  False negative markers: {metrics['false_negative']}")
+        print(f"  False positive markers: {metrics['false_positive']}")
+        print(f"  Misclassified markers: {metrics['misclassified']}")
+
+        # Only save NIfTI files if not evaluating the full dataset.
+        if not evaluate_mode and len(model_paths) == 1:
+            base_name = os.path.splitext(os.path.basename(model_filepath))[0]
+            seg_img = nib.Nifti1Image(seg_np, subject['image'].affine)
+            seg_out_path = f"{base_name}_inference_segmentation.nii.gz"
+            nib.save(seg_img, seg_out_path)
+            print(f"Saved segmentation to {seg_out_path}")
+            probs_np = probs.squeeze(0).cpu().numpy()
+            for class_idx in range(num_classes):
+                prob_map = probs_np[class_idx, ...]
+                prob_img = nib.Nifti1Image(prob_map, subject['image'].affine)
+                prob_out_path = f"{base_name}_inference_probability_class_{class_idx}.nii.gz"
+                nib.save(prob_img, prob_out_path)
+                print(f"Saved probability map for class {class_idx} to {prob_out_path}")
+            input_np = subject['image'].data.squeeze(0).cpu().numpy()
+            input_img = nib.Nifti1Image(input_np, subject['image'].affine)
+            input_out_path = f"{base_name}_inference_input.nii.gz"
+            nib.save(input_img, input_out_path)
+            print(f"Saved input image to {input_out_path}")
+            gt_img = nib.Nifti1Image(gt_tensor, subject['image'].affine)
+            gt_out_path = f"{base_name}_ground_truth_segmentation.nii.gz"
+            nib.save(gt_img, gt_out_path)
+            print(f"Saved ground truth segmentation to {gt_out_path}")
+
+        summary_dict = {
+            "Model path": model_filepath,
+            "Fold ID": fold_id,
+            "Input image path": subject_row[infile_cols[0]],
+            "Actual markers": metrics["actual_markers"],
+            "True positives": metrics["true_positive"],
+            "False negatives": metrics["false_negative"],
+            "False positives": metrics["false_positive"],
+            "Misclassified": metrics["misclassified"]
         }
-        df_results = pd.DataFrame(data)
-        print(df_results.T.rename(columns={0: "Value"}), flush=True)
+        summary_list.append(summary_dict)
 
-        
-    else:
-        print("No matching ground-truth segmentation found for the input file.", flush=True)
+    if len(model_paths) > 1 or (not evaluate_mode and len(model_paths) == 1):
+        summary_df = pd.DataFrame(summary_list)
+        print("\nSummary Metrics for all models:")
+        print(summary_df.to_string(index=False))
 
-if __name__ == '__main__':
+        total_actual = summary_df["Actual markers"].sum()
+        total_true_positive = summary_df["True positives"].sum()
+        total_false_negative = summary_df["False negatives"].sum()
+        total_false_positive = summary_df["False positives"].sum()
+        total_misclassified = summary_df["Misclassified"].sum()
+
+        print("\nTotal Metrics Across All Models:")
+        print(f"Total actual markers: {total_actual}")
+        print(f"Total true positive markers: {total_true_positive}")
+        print(f"Total false negative markers: {total_false_negative}")
+        print(f"Total false positive markers: {total_false_positive}")
+        print(f"Total misclassified markers: {total_misclassified}")
+
+        if total_actual > 0:
+            tp_pct = total_true_positive / total_actual * 100
+            fn_pct = total_false_negative / total_actual * 100
+            fp_pct = total_false_positive / total_actual * 100
+            mis_pct = total_misclassified / total_actual * 100
+            print("\nPercentage Metrics (relative to actual markers):")
+            print(f"True positive percentage: {tp_pct:.2f}%")
+            print(f"False negative percentage: {fn_pct:.2f}%")
+            print(f"False positive percentage: {fp_pct:.2f}%")
+            print(f"Misclassified percentage: {mis_pct:.2f}%")
+
+if __name__ == "__main__":
     main()
