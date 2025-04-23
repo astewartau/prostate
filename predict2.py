@@ -1,11 +1,10 @@
-#!/usr/bin/env python
-
 import argparse
 import os
 import numpy as np
 import torch
 import torch.nn.functional as F
 import nibabel as nib
+import SimpleITK as sitk
 
 
 def parse_args():
@@ -20,6 +19,11 @@ def parse_args():
                         help='Device to run inference on')
     return parser.parse_args()
 
+def apply_homogeneity_correction(image_data):
+    sitk_image = sitk.GetImageFromArray(image_data)
+    mask = sitk.OtsuThreshold(sitk_image, 0, 1, 200)
+    corrected_image = sitk.N4BiasFieldCorrection(sitk_image, mask)
+    return sitk.GetArrayFromImage(corrected_image)
 
 class UNet3D(torch.nn.Module):
     def __init__(self, in_channels, out_channels, channels=(16,32,64,128,256)):
@@ -119,10 +123,14 @@ def main():
 
     img = nib.load(args.input)
     vol = img.get_fdata().astype(np.float32)
-    vol_n = z_normalize(vol)
+
+    vol = apply_homogeneity_correction(vol)
+
 
     crop_size = (100, 100, 64)
     vol_crop, orig_shape, pad_cfg, crop_start = center_crop_or_pad(vol_n, crop_size)
+    
+    vol_n = z_normalize(vol)
 
     x = torch.from_numpy(vol_crop).unsqueeze(0).unsqueeze(0).to(device)
     with torch.no_grad():
