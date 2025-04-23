@@ -19,6 +19,8 @@ def parse_args():
                         help='Directory to save outputs')
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu',
                         help='Device to run inference on')
+    parser.add_argument('--do_homogeneity_correction', action='store_true',
+                        help='Apply homogeneity correction to the input volume')
     return parser.parse_args()
 
 def apply_homogeneity_correction(image_data):
@@ -126,13 +128,13 @@ def main():
     img = nib.load(args.input)
     vol = img.get_fdata().astype(np.float32)
 
-    vol = apply_homogeneity_correction(vol)
-
+    if args.do_homogeneity_correction:
+        vol = apply_homogeneity_correction(vol)
 
     crop_size = (100, 100, 64)
-    vol_crop, orig_shape, pad_cfg, crop_start = center_crop_or_pad(vol_n, crop_size)
+    vol_crop, orig_shape, pad_cfg, crop_start = center_crop_or_pad(vol, crop_size)
     
-    vol_n = z_normalize(vol)
+    vol = z_normalize(vol)
 
     x = torch.from_numpy(vol_crop).unsqueeze(0).unsqueeze(0).to(device)
     with torch.no_grad():
