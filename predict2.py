@@ -130,11 +130,12 @@ def main():
 
     if args.do_homogeneity_correction:
         vol = apply_homogeneity_correction(vol)
+    vol = z_normalize(vol)
 
     crop_size = (100, 100, 64)
     vol_crop, orig_shape, pad_cfg, crop_start = center_crop_or_pad(vol, crop_size)
     
-    vol = z_normalize(vol)
+    #vol = z_normalize(vol) # RESULTS IN EMPTY RESULTS
 
     x = torch.from_numpy(vol_crop).unsqueeze(0).unsqueeze(0).to(device)
     with torch.no_grad():
