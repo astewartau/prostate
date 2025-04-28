@@ -182,7 +182,7 @@ def main():
     for i in range(probs.shape[0]):
         inv = invert_crop_pad(probs[i], orig_shape, crop_params, pad_params)
         nib.save(nib.Nifti1Image(inv, img.affine, hdr),
-                 os.path.join(args.output_dir, f"probclass{i}.nii.gz"))
+                 os.path.join(args.output_dir, f"prob_class{i}.nii.gz"))
     seg = np.argmax(probs, axis=0).astype(np.uint8)
     seg_inv = invert_crop_pad(seg, orig_shape, crop_params, pad_params)
     nib.save(nib.Nifti1Image(seg_inv, img.affine, hdr),
