@@ -1,158 +1,194 @@
-#!/usr/bin/env python
-
-import argparse
+#!/usr/bin/env python3
 import os
-import numpy as np
+import argparse
 import torch
-import torch.nn.functional as F
 import nibabel as nib
-import SimpleITK as sitk
+import torchio as tio
+import numpy as np
 
+import torch.nn as nn
+import torch.nn.functional as F
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Run 3D UNet segmentation on a NIfTI volume')
-    parser.add_argument('-i', '--input', required=True,
-                        help='Input NIfTI file path')
-    parser.add_argument('-m', '--model', required=True,
-                        help='Trained model .pth file')
-    parser.add_argument('-o', '--output_dir', required=True,
-                        help='Directory to save outputs')
-    parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu',
-                        help='Device to run inference on')
-    parser.add_argument('--do_homogeneity_correction', action='store_true',
-                        help='Apply homogeneity correction to the input volume')
-    return parser.parse_args()
-
-def apply_homogeneity_correction(image_data):
-    sitk_image = sitk.GetImageFromArray(image_data)
-    mask = sitk.OtsuThreshold(sitk_image, 0, 1, 200)
-    corrected_image = sitk.N4BiasFieldCorrection(sitk_image, mask)
-    return sitk.GetArrayFromImage(corrected_image)
-
-class UNet3D(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, channels=(16,32,64,128,256)):
-        super().__init__()
-        self.pool = torch.nn.MaxPool3d(2)
-        prev = in_channels
-        self.encoders = torch.nn.ModuleList()
+class UNet3D(nn.Module):
+    def __init__(self, in_channels, out_channels, channels=(16, 32, 64, 128, 256)):
+        super(UNet3D, self).__init__()
+        self.encoders = nn.ModuleList()
+        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        prev_channels = in_channels
         for ch in channels:
-            self.encoders.append(self.conv_block(prev, ch))
-            prev = ch
-        self.bottleneck = self.conv_block(prev, prev*2)
-        rev = list(reversed(channels))
-        self.upconvs = torch.nn.ModuleList()
-        self.decoders = torch.nn.ModuleList()
-        cur = prev*2
-        for ch in rev:
-            self.upconvs.append(torch.nn.ConvTranspose3d(cur, ch, 2, 2))
-            self.decoders.append(self.conv_block(ch*2, ch))
-            cur = ch
-        # match training state dict keys
-        self.final_conv = torch.nn.Conv3d(cur, out_channels, 1)
-
-    def conv_block(self, in_ch, out_ch):
-        return torch.nn.Sequential(
-            torch.nn.Conv3d(in_ch, out_ch, 3, padding=1),
-            torch.nn.BatchNorm3d(out_ch),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv3d(out_ch, out_ch, 3, padding=1),
-            torch.nn.BatchNorm3d(out_ch),
-            torch.nn.ReLU(inplace=True)
+            self.encoders.append(self.conv_block(prev_channels, ch))
+            prev_channels = ch
+        self.bottleneck = self.conv_block(prev_channels, prev_channels * 2)
+        rev_channels = list(reversed(channels))
+        self.upconvs = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        cur_channels = prev_channels * 2
+        for ch in rev_channels:
+            self.upconvs.append(nn.ConvTranspose3d(cur_channels, ch, kernel_size=2, stride=2))
+            self.decoders.append(self.conv_block(ch * 2, ch))
+            cur_channels = ch
+        self.final_conv = nn.Conv3d(cur_channels, 3, kernel_size=1)
+    def conv_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
         )
-
     def forward(self, x):
-        feats = []
-        for enc in self.encoders:
-            x = enc(x)
-            feats.append(x)
+        enc_feats = []
+        for encoder in self.encoders:
+            x = encoder(x)
+            enc_feats.append(x)
             x = self.pool(x)
         x = self.bottleneck(x)
-        for up, dec, enc_feat in zip(self.upconvs, self.decoders, reversed(feats)):
-            x = up(x)
-            if x.shape != enc_feat.shape:
-                diff = [e - x for e, x in zip(enc_feat.shape[2:], x.shape[2:])]
-                pads = []
-                for d in reversed(diff):
-                    pads += [d//2, d - d//2]
-                x = F.pad(x, pads)
-            x = torch.cat([enc_feat, x], dim=1)
-            x = dec(x)
+        for upconv, decoder, enc in zip(self.upconvs, self.decoders, reversed(enc_feats)):
+            x = upconv(x)
+            if x.shape != enc.shape:
+                diffZ = enc.size()[2] - x.size()[2]
+                diffY = enc.size()[3] - x.size()[3]
+                diffX = enc.size()[4] - x.size()[4]
+                x = F.pad(x, [diffX // 2, diffX - diffX // 2,
+                              diffY // 2, diffY - diffY // 2,
+                              diffZ // 2, diffZ - diffZ // 2])
+            x = torch.cat([enc, x], dim=1)
+            x = decoder(x)
         return self.final_conv(x)
 
 
-def z_normalize(vol):
-    mask = vol != 0
-    vals = vol[mask]
-    if vals.size == 0:
-        return vol
-    m, s = vals.mean(), vals.std()
-    if s == 0:
-        return vol - m
-    return (vol - m) / s
+# your MergeInputChannels from training
+class MergeInputChannels(tio.Transform):
+    def __init__(self, infile_cols):
+        super().__init__()
+        self.infile_cols = infile_cols
+    def apply_transform(self, subject):
+        tensors = []
+        for col in self.infile_cols:
+            img = subject.get(col)
+            if img is None: continue
+            data = img.data
+            if data.ndim == 3:
+                data = data.unsqueeze(0)
+            tensors.append(data)
+        merged = torch.cat(tensors, dim=0)
+        subject['image'] = tio.ScalarImage(
+            tensor=merged, affine=subject[self.infile_cols[0]].affine
+        )
+        return subject
 
+# compute how we cropped/padded
+def get_crop_pad_params(orig_shape, proc_shape, target_shape=(100,100,64)):
+    crop_params, pad_params = [None]*3, [None]*3
+    for ax in range(3):
+        od, pd = orig_shape[ax], proc_shape[ax]
+        td = target_shape[ax]
+        # center‐crop if larger
+        if od >= td:
+            start = (od - td)//2
+            crop_params[ax] = (start, start+td)
+        else:
+            crop_params[ax] = None
+        # pad if smaller
+        if od < td:
+            diff = td - od
+            left = diff//2
+            pad_params[ax] = (left, diff-left)
+        else:
+            pad_params[ax] = None
+    return crop_params, pad_params
 
-def center_crop_or_pad(vol, size):
-    orig = vol.shape
-    pads = []
-    for o, s in zip(orig, size):
-        diff = max(0, s - o)
-        pads.extend([diff//2, diff - diff//2])
-    pad_cfg = [(pads[c*2], pads[c*2+1]) for c in range(3)]
-    vol_p = np.pad(vol, pad_cfg, mode='constant')
-    start = [(p[0] + (vol_p.shape[i] - size[i] - p[0] - p[1])//2) for i, p in enumerate(pad_cfg)]
-    end = [st + size[i] for i, st in enumerate(start)]
-    slices = tuple(slice(st, ed) for st, ed in zip(start, end))
-    return vol_p[slices], orig, pad_cfg, start
+# undo crop+pad
+def invert_crop_pad(arr, orig_shape, crop_params, pad_params):
+    # first undo padding
+    sl = []
+    for ax in range(3):
+        if pad_params[ax]:
+            l,_ = pad_params[ax]
+            sl.append(slice(l, l+orig_shape[ax]))
+        else:
+            sl.append(slice(None))
+    truncated = arr[sl[0], sl[1], sl[2]]
+    # then place into zeros of orig shape at crop location
+    out = np.zeros(orig_shape, dtype=truncated.dtype)
+    for ax in range(3):
+        if crop_params[ax]:
+            s,e = crop_params[ax]
+            sl_out = [slice(None)]*3
+            sl_out[ax] = slice(s,e)
+        else:
+            sl_out = [slice(None)]*3
+        # combine all axes
+    # better to build full sl_out list once:
+    sl_out = []
+    for ax in range(3):
+        if crop_params[ax]:
+            s,e = crop_params[ax]
+            sl_out.append(slice(s,e))
+        else:
+            sl_out.append(slice(None))
+    out[sl_out[0], sl_out[1], sl_out[2]] = truncated
+    return out
 
-
-def invert_crop_and_pad(pred, orig_shape, pad_cfg, crop_start):
-    padded_shape = [orig_shape[i] + pad_cfg[i][0] + pad_cfg[i][1] for i in range(3)]
-    padded = np.zeros(padded_shape, dtype=pred.dtype)
-    cs = crop_start
-    ce = [cs[i] + pred.shape[i] for i in range(3)]
-    padded[cs[0]:ce[0], cs[1]:ce[1], cs[2]:ce[2]] = pred
-    slices = tuple(slice(pad_cfg[i][0], pad_cfg[i][0] + orig_shape[i]) for i in range(3))
-    return padded[slices]
-
+def parse_args():
+    p = argparse.ArgumentParser(description='3D-UNet inference with TorchIO preprocessing')
+    p.add_argument('-i','--input',     required=True, help='Input NIfTI file')
+    p.add_argument('-m','--model',     required=True, help='Trained .pth file')
+    p.add_argument('-o','--output_dir',required=True, help='Where to save outputs')
+    p.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
+    return p.parse_args()
 
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    model = UNet3D(in_channels=1, out_channels=3)
+    # --- 1) build the same TorchIO pipeline ---
+    infile_cols = ['t1_corrected']   # or your list
+    transforms = tio.Compose([
+        tio.CropOrPad((100,100,64)),
+        tio.ZNormalization(),
+        MergeInputChannels(infile_cols),
+    ])
+
+    # --- 2) load model ---
+    model = UNet3D(in_channels=len(infile_cols), out_channels=3).to(device)
     state = torch.load(args.model, map_location=device)
-    model.load_state_dict(state)
-    model.to(device).eval()
+    model.load_state_dict(state if 'model_state_dict' not in state else state['model_state_dict'])
+    model.eval()
 
+    # --- 3) load input & record original shape/header ---
     img = nib.load(args.input)
-    vol = img.get_fdata().astype(np.float32)
+    orig_np = img.get_fdata().astype(np.float32)
+    orig_shape = orig_np.shape
+    hdr = img.header
 
-    if args.do_homogeneity_correction:
-        vol = apply_homogeneity_correction(vol)
-    vol = z_normalize(vol)
+    # --- 4) wrap in a Subject and preprocess ---
+    subj = tio.Subject(**{infile_cols[0]: tio.ScalarImage(args.input)})
+    subj_t = transforms(subj)
+    proc_np = subj_t['image'].data.squeeze(0).numpy()  # shape (100,100,64)
 
-    crop_size = (100, 100, 64)
-    vol_crop, orig_shape, pad_cfg, crop_start = center_crop_or_pad(vol, crop_size)
-    
-    #vol = z_normalize(vol) # RESULTS IN EMPTY RESULTS
+    # figure out crop/pad params
+    crop_params, pad_params = get_crop_pad_params(orig_shape, proc_np.shape)
 
-    x = torch.from_numpy(vol_crop).unsqueeze(0).unsqueeze(0).to(device)
+    # --- 5) inference ---
+    tensor = torch.from_numpy(proc_np).unsqueeze(0).to(device)  # [1,D,H,W]
     with torch.no_grad():
-        out = model(x)
-        probs = F.softmax(out, dim=1)[0].cpu().numpy()
-    seg_crop = np.argmax(probs, axis=0)
+        out = model(tensor.unsqueeze(0))[0]       # [3,100,100,64]
+        probs = F.softmax(out, dim=0).cpu().numpy()
 
-    for cls in range(probs.shape[0]):
-        p = probs[cls]
-        p_full = invert_crop_and_pad(p, orig_shape, pad_cfg, crop_start)
-        out_img = nib.Nifti1Image(p_full.astype(np.float32), img.affine, img.header)
-        nib.save(out_img, os.path.join(args.output_dir, f'prob_class{cls}.nii.gz'))
+    # --- 6) invert & save ---
+    for i in range(probs.shape[0]):
+        inv = invert_crop_pad(probs[i], orig_shape, crop_params, pad_params)
+        nib.save(nib.Nifti1Image(inv, img.affine, hdr),
+                 os.path.join(args.output_dir, f"probclass{i}.nii.gz"))
+    seg = np.argmax(probs, axis=0).astype(np.uint8)
+    seg_inv = invert_crop_pad(seg, orig_shape, crop_params, pad_params)
+    nib.save(nib.Nifti1Image(seg_inv, img.affine, hdr),
+             os.path.join(args.output_dir, "segmentation.nii.gz"))
 
-    seg_full = invert_crop_and_pad(seg_crop, orig_shape, pad_cfg, crop_start)
-    seg_img = nib.Nifti1Image(seg_full.astype(np.uint8), img.affine, img.header)
-    nib.save(seg_img, os.path.join(args.output_dir, 'segmentation.nii.gz'))
-
+    print("Done.", flush=True)
 
 if __name__ == '__main__':
     main()
