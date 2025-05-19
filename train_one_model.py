@@ -42,7 +42,8 @@ timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y%m%d-%H%M%S
 batch_size = 6
 training_epochs = 700
 lr = 0.003
-ce_loss_weights = torch.Tensor([1, 1, 1])
+num_classes = 3
+ce_loss_weights = torch.ones(num_classes) # e.g. [1, 1]
 
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
@@ -190,6 +191,8 @@ class TorchIODatasetWrapper(torch.utils.data.Dataset):
             raise KeyError("Missing 'mask' key in subject")
         mask = subject['mask'].data.squeeze(0)
         mask = mask.long()
+        # remap calcification (2) → background (0)
+        # mask = torch.where(mask == 2, torch.zeros_like(mask), mask)
         return image, mask
 
 train_dataset = TorchIODatasetWrapper(train_subjects_dataset)
@@ -217,7 +220,7 @@ class UNet3D(nn.Module):
             self.upconvs.append(nn.ConvTranspose3d(cur_channels, ch, kernel_size=2, stride=2))
             self.decoders.append(self.conv_block(ch * 2, ch))
             cur_channels = ch
-        self.final_conv = nn.Conv3d(cur_channels, 3, kernel_size=1)
+        self.final_conv = nn.Conv3d(cur_channels, out_channels, kernel_size=1)
     def conv_block(self, in_channels, out_channels):
         return nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
@@ -247,7 +250,7 @@ class UNet3D(nn.Module):
             x = decoder(x)
         return self.final_conv(x)
 
-model = UNet3D(in_channels=len(infile_cols), out_channels=3).to(device)
+model = UNet3D(in_channels=len(infile_cols), out_channels=num_classes).to(device)
 
 ce_loss_fn = nn.CrossEntropyLoss(weight=ce_loss_weights.to(device))
 def dice_loss(pred, target, eps=1e-5):

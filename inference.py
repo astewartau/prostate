@@ -260,7 +260,7 @@ def evaluate_full_dataset(df, model, infile_cols, segmentation_col, transforms, 
 
 # Evaluate LOOCV; this function runs the leave-one-out evaluation across all provided models,
 # prints per-fold outputs, and builds a summary dataframe with aggregated metrics.
-def evaluate_loocv(df, model_filepaths, infile_cols, segmentation_col, transforms, device, save_outputs):
+def evaluate_loocv(df, model_filepaths, infile_cols, segmentation_col, num_classes, transforms, device, save_outputs):
     fold_summaries = []
     kf = KFold(n_splits=len(df), random_state=42, shuffle=True)
     splits = list(kf.split(df))
@@ -277,7 +277,7 @@ def evaluate_loocv(df, model_filepaths, infile_cols, segmentation_col, transform
         row = df.iloc[val_subject_idx]
         print(f"Running inference on subject index: {val_subject_idx}")
         subject = prepare_subject(row, infile_cols, segmentation_col, transforms)
-        model = load_model(model_filepath, in_channels=len(infile_cols), num_classes=3, device=device)
+        model = load_model(model_filepath, in_channels=len(infile_cols), num_classes=num_classes, device=device)
         seg_np, probs, metrics = run_inference_on_subject(model, subject, device)
         for col in infile_cols:
             if col in row:
@@ -335,7 +335,7 @@ def evaluate_loocv(df, model_filepaths, infile_cols, segmentation_col, transform
             print(f"Misclassified percentage: {mis_pct:.2f}%")
 
 # Save NIfTI outputs
-def save_nifti_outputs(model_filepath, subject, seg_np, probs, num_classes=3):
+def save_nifti_outputs(model_filepath, subject, seg_np, probs, num_classes):
     base_name = os.path.splitext(os.path.basename(model_filepath))[0]
     seg_img = nib.Nifti1Image(seg_np, subject['image'].affine)
     seg_out_path = f"{base_name}_inference_segmentation.nii.gz"
@@ -398,7 +398,7 @@ def main():
         model = load_model(args.model[0], in_channels, num_classes, device)
         evaluate_full_dataset(df, model, infile_cols, segmentation_col, common_transforms, device)
     else:
-        evaluate_loocv(df, args.model, infile_cols, segmentation_col,
+        evaluate_loocv(df, args.model, infile_cols, segmentation_col, num_classes,
                        common_transforms, device, args.save_outputs)
 
 if __name__ == "__main__":
